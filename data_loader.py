@@ -20,33 +20,18 @@ GOOGLE_SHEET_PHILIPS_ID = "1s7Whvwpvf_5gMXyqtQwSk1NOU3rOFOjrU-P_LsvjnCw"
 GOOGLE_SHEET_CONFIG_ID = "1ZhgCW_hCA8dvj2UENKdBupQ9TaK9MWbOFQc6gojALVI"
 GOOGLE_SHEET_CARGO_ID = "1xYJ2Rr6PCCGBh78RZHqAWGoHmWgfLxIIIT0KRsq1r8U"
 
-# LISTA EXPLICITA DE PROVEEDORES DE IMPORTACIÓN DEFINIDOS POR EL USUARIO
 IMPORT_KEYWORDS = [
-    'at-os',
-    'merivaara',
-    'respironics',
-    'rimsa',
-    'givas',
-    'vassilli',
-    'cmr',
-    'heartstream netherlands',
-    'healing resources',
-    'dell marketing',
-    'simad',
-    'italray',
-    'opt surgisystems',
-    'schiller americas inc' # Solamente la entidad extranjera
+    'at-os', 'merivaara', 'respironics', 'rimsa', 'givas', 'vassilli', 'cmr',
+    'heartstream netherlands', 'healing resources', 'dell marketing',
+    'simad', 'italray', 'opt surgisystems', 'schiller americas inc'
 ]
 
 def clasificar_proveedor(nombre_proveedor):
     if pd.isna(nombre_proveedor):
         return "🇲🇽 Nacional"
     nombre_clean = str(nombre_proveedor).lower().strip()
-    
-    # Excepción explícita para la filial nacional de Schiller
     if "schiller americas-mexico" in nombre_clean or "schiller americas mexico" in nombre_clean:
         return "🇲🇽 Nacional"
-        
     for kw in IMPORT_KEYWORDS:
         if kw in nombre_clean:
             return "🚢 Importación (Requiere Doc)"
@@ -94,19 +79,17 @@ def buscar_archivo_local(nombres_posibles):
     return None
 
 # ---------------------------------------------------------
-# 1. CARGA EXCLUSIVA DEL MÓDULO DE COMPRAS ODOO (API / EXCEL)
+# 1. CARGA EXCLUSIVA DEL MÓDULO DE COMPRAS ODOO
 # ---------------------------------------------------------
 def load_po_data(odoo_db=None, odoo_user=None, odoo_password=None):
     db = odoo_db if odoo_db else DEFAULT_ODOO_DB
     user = odoo_user if odoo_user else DEFAULT_ODOO_USER
     password = odoo_password if odoo_password else DEFAULT_ODOO_PASS
 
-    # 1. Intentar extracción por API Odoo en vivo
     df_live = fetch_odoo_live(db, user, password)
     if df_live is not None and not df_live.empty:
         return df_live
 
-    # 2. Fallback a archivo Excel local de Compras
     ruta = buscar_archivo_local([
         "Orden de compra (purchase.order).xlsx",
         "Orden de compra (purchase.order)_2.xlsx",
@@ -139,8 +122,6 @@ def fetch_odoo_live(db, user, password):
             return None
 
         models = xmlrpc.client.ServerProxy(f'{ODOO_URL}/xmlrpc/2/object')
-
-        # Consulta directa EXCLUSIVA al modelo purchase.order
         po_domain = [('state', '!=', 'cancel')]
         po_ids = models.execute_kw(db, uid, password, 'purchase.order', 'search', [po_domain])
         
@@ -168,7 +149,7 @@ def fetch_odoo_live(db, user, password):
 
         line_ids = models.execute_kw(db, uid, password, 'purchase.order.line', 'search', [[('order_id', 'in', po_ids)]])
         if line_ids:
-            line_fields = ['order_id', 'product_id', 'name', 'product_qty', 'price_subtotal', 'date_planned']
+            line_fields = ['order_id', 'product_id', 'name', 'product_qty', 'price_unit', 'price_subtotal', 'date_planned']
             lines = models.execute_kw(db, uid, password, 'purchase.order.line', 'read', [line_ids], {'fields': line_fields})
             
             rows = []
@@ -193,28 +174,13 @@ def fetch_odoo_live(db, user, password):
                     'Fecha límite de la orden': line.get('date_planned') or po_info['date_planned'],
                     'Producto': prod_name,
                     'Cantidad': line.get('product_qty', 1),
+                    'Precio Unitario': line.get('price_unit', 0),
                     'Total': line.get('price_subtotal', 0),
                     'Moneda': po_info['currency']
                 })
             
             if rows:
                 return procesar_df_po(pd.DataFrame(rows))
-
-        rows = []
-        for p_id, po_info in po_dict.items():
-            rows.append({
-                'Referencia de la orden': po_info['po_name'],
-                'Proveedor': po_info['vendor'],
-                'Comprador': po_info['buyer'],
-                'Empresa': po_info['company'],
-                'Estado': po_info['state'],
-                'Fecha límite de la orden': po_info['date_planned'],
-                'Producto': 'Consolidado Compras Odoo',
-                'Cantidad': 1,
-                'Total': po_info['amount_total'],
-                'Moneda': po_info['currency']
-            })
-        return procesar_df_po(pd.DataFrame(rows))
 
     except Exception as e:
         print(f"Aviso API Odoo: {e}")
@@ -226,16 +192,13 @@ def procesar_df_po(df_in):
 
     df = df_in.copy()
 
-    if 'Referencia de la orden' in df.columns and 'Total' in df.columns:
-        df = df.dropna(subset=['Referencia de la orden'], how='all')
-
-    df['Referencia de la orden'] = df['Referencia de la orden'].ffill() if 'Referencia de la orden' in df.columns else 'Sin Ref'
-    df['Comprador'] = df['Comprador'].ffill().fillna('Sin Asignar') if 'Comprador' in df.columns else 'Sin Asignar'
-    df['Empresa'] = df['Empresa'].ffill().fillna('Sin Empresa') if 'Empresa' in df.columns else 'Sin Empresa'
-    df['Proveedor'] = df['Proveedor'].ffill().fillna('Sin Proveedor') if 'Proveedor' in df.columns else 'Sin Proveedor'
-    df['Estado'] = df['Estado'].fillna('Sin Estado') if 'Estado' in df.columns else 'Sin Estado'
-    df['Moneda'] = df['Moneda'].fillna('MXN') if 'Moneda' in df.columns else 'MXN'
-    df['Producto'] = df['Producto'].fillna('Sin Especificar') if 'Producto' in df.columns else 'Sin Especificar'
+    df['Referencia de la orden'] = df['Referencia de la orden'].ffill().fillna('Sin Ref')
+    df['Comprador'] = df['Comprador'].ffill().fillna('Sin Asignar')
+    df['Empresa'] = df['Empresa'].ffill().fillna('Sin Empresa')
+    df['Proveedor'] = df['Proveedor'].ffill().fillna('Sin Proveedor')
+    df['Estado'] = df['Estado'].fillna('Sin Estado')
+    df['Moneda'] = df['Moneda'].fillna('MXN')
+    df['Producto'] = df['Producto'].fillna('Sin Especificar')
 
     estado_map = {
         'draft': 'Solicitud de cotización',
@@ -262,39 +225,10 @@ def procesar_df_po(df_in):
     df['Semaforo'] = df.apply(lambda r: calcular_semaforo(r, fecha_ref), axis=1)
     df['Semaforo_Importacion'] = df.apply(lambda r: calcular_semaforo_importacion(r, fecha_ref), axis=1)
 
-    # ---------------------------------------------------------
-    # CONSOLIDACIÓN / AGRUPACIÓN POR FOLIO DE COMPRA ÚNICO
-    # ---------------------------------------------------------
-    def join_items(series):
-        items = [str(x).strip() for x in series if pd.notna(x) and str(x).strip() != '']
-        seen = set()
-        unique_items = []
-        for item in items:
-            if item not in seen:
-                seen.add(item)
-                unique_items.append(item)
-        return " | ".join(unique_items) if unique_items else "Sin Especificar"
-
-    grouped = df.groupby('Referencia de la orden', as_index=False).agg({
-        'Empresa': 'first',
-        'Estado': 'first',
-        'Semaforo': 'first',
-        'Semaforo_Importacion': 'first',
-        'Tipo_Proveedor': 'first',
-        'Proveedor': 'first',
-        'Producto': join_items,
-        'Cantidad': 'sum',
-        'Moneda': 'first',
-        'Total': 'sum',
-        'Total_MXN': 'sum',
-        'Comprador': 'first',
-        'Fecha_Limite': 'first'
-    })
-
-    return grouped
+    return df
 
 # ---------------------------------------------------------
-# 2. CARGA DE SEGUIMIENTO PHILIPS (GOOGLE SHEETS / LOCAL)
+# 2. CARGA DE SEGUIMIENTO PHILIPS
 # ---------------------------------------------------------
 def load_philips_data():
     url_online = f"https://docs.google.com/spreadsheets/d/{GOOGLE_SHEET_PHILIPS_ID}/export?format=xlsx"
@@ -308,8 +242,7 @@ def load_philips_data():
 
     ruta = buscar_archivo_local([
         "Seguimiento Philips _ MPC - Ordenes de compra.xlsx",
-        "Seguimiento Philips _ MPC - Ordenes de compra_2.xlsx",
-        "Seguimiento Philips _ MPC - Ordenes de compra_3.xlsx"
+        "Seguimiento Philips _ MPC - Ordenes de compra_2.xlsx"
     ])
     if not ruta or not os.path.exists(ruta):
         return pd.DataFrame()
@@ -366,7 +299,7 @@ def procesar_excel_philips(xls):
     return df_all
 
 # ---------------------------------------------------------
-# 3. CARGA DE CONFIGURACIONES 2026 (GOOGLE SHEETS / LOCAL)
+# 3. CARGA DE CONFIGURACIONES 2026
 # ---------------------------------------------------------
 def load_config_data():
     url_online = f"https://docs.google.com/spreadsheets/d/{GOOGLE_SHEET_CONFIG_ID}/export?format=xlsx"
@@ -380,8 +313,7 @@ def load_config_data():
 
     ruta = buscar_archivo_local([
         "PENDIENTES _ CONFIGURACIONES 2026.xlsx",
-        "PENDIENTES _ CONFIGURACIONES 2026_2.xlsx",
-        "PENDIENTES _ CONFIGURACIONES 2026_3.xlsx"
+        "PENDIENTES _ CONFIGURACIONES 2026_2.xlsx"
     ])
     if not ruta or not os.path.exists(ruta):
         return pd.DataFrame()
@@ -437,7 +369,7 @@ def procesar_excel_config(xls):
     return df_all
 
 # ---------------------------------------------------------
-# 4. CARGA DE SEGUIMIENTO DE AGENTE ADUANAL (CARGO)
+# 4. CARGA DE SEGUIMIENTO AGENTE ADUANAL (CARGO)
 # ---------------------------------------------------------
 def load_cargo_data():
     url_online = f"https://docs.google.com/spreadsheets/d/{GOOGLE_SHEET_CARGO_ID}/export?format=xlsx"
@@ -451,8 +383,7 @@ def load_cargo_data():
 
     ruta = buscar_archivo_local([
         "Seguimiento CARGO.xlsx",
-        "CARGO.xlsx",
-        "Seguimiento Importacion CARGO.xlsx"
+        "CARGO.xlsx"
     ])
     if not ruta or not os.path.exists(ruta):
         return pd.DataFrame()
