@@ -18,6 +18,7 @@ DEFAULT_ODOO_PASS = "Manprec2025%"
 
 GOOGLE_SHEET_PHILIPS_ID = "1s7Whvwpvf_5gMXyqtQwSk1NOU3rOFOjrU-P_LsvjnCw"
 GOOGLE_SHEET_CONFIG_ID = "1ZhgCW_hCA8dvj2UENKdBupQ9TaK9MWbOFQc6gojALVI"
+GOOGLE_SHEET_CARGO_ID = "1xYJ2Rr6PCCGBh78RZHqAWGoHmWgfLxIIIT0KRsq1r8U"
 
 # LISTA EXPLICITA DE PROVEEDORES DE IMPORTACIÓN DEFINIDOS POR EL USUARIO
 IMPORT_KEYWORDS = [
@@ -226,7 +227,7 @@ def procesar_df_po(df_in):
     df = df_in.copy()
 
     if 'Referencia de la orden' in df.columns and 'Total' in df.columns:
-        df = df.dropna(subset=['Referencia de la orden', 'Total'], how='all').copy()
+        df = df.dropna(subset=['Referencia de la orden'], how='all')
 
     df['Referencia de la orden'] = df['Referencia de la orden'].ffill() if 'Referencia de la orden' in df.columns else 'Sin Ref'
     df['Comprador'] = df['Comprador'].ffill().fillna('Sin Asignar') if 'Comprador' in df.columns else 'Sin Asignar'
@@ -234,7 +235,8 @@ def procesar_df_po(df_in):
     df['Proveedor'] = df['Proveedor'].ffill().fillna('Sin Proveedor') if 'Proveedor' in df.columns else 'Sin Proveedor'
     df['Estado'] = df['Estado'].fillna('Sin Estado') if 'Estado' in df.columns else 'Sin Estado'
     df['Moneda'] = df['Moneda'].fillna('MXN') if 'Moneda' in df.columns else 'MXN'
-    
+    df['Producto'] = df['Producto'].fillna('Sin Especificar') if 'Producto' in df.columns else 'Sin Especificar'
+
     estado_map = {
         'draft': 'Solicitud de cotización',
         'sent': 'Cotización enviada',
@@ -249,7 +251,6 @@ def procesar_df_po(df_in):
     df['Total'] = pd.to_numeric(df['Total'] if 'Total' in df.columns else 0, errors='coerce').fillna(0)
     df['Total_MXN'] = df.apply(lambda r: r['Total'] * tasas.get(str(r['Moneda']).upper(), 1.0), axis=1)
     
-    df['Producto'] = df['Producto'].fillna('Sin Especificar') if 'Producto' in df.columns else 'Sin Especificar'
     cant_col = 'Producto/Cantidad de material' if 'Producto/Cantidad de material' in df.columns else 'Cantidad'
     df['Cantidad'] = pd.to_numeric(df[cant_col] if cant_col in df.columns else 1, errors='coerce').fillna(1)
     
@@ -261,8 +262,36 @@ def procesar_df_po(df_in):
     df['Semaforo'] = df.apply(lambda r: calcular_semaforo(r, fecha_ref), axis=1)
     df['Semaforo_Importacion'] = df.apply(lambda r: calcular_semaforo_importacion(r, fecha_ref), axis=1)
 
-    df = df.loc[:, ~df.columns.duplicated(keep='first')].copy()
-    return df
+    # ---------------------------------------------------------
+    # CONSOLIDACIÓN / AGRUPACIÓN POR FOLIO DE COMPRA ÚNICO
+    # ---------------------------------------------------------
+    def join_items(series):
+        items = [str(x).strip() for x in series if pd.notna(x) and str(x).strip() != '']
+        seen = set()
+        unique_items = []
+        for item in items:
+            if item not in seen:
+                seen.add(item)
+                unique_items.append(item)
+        return " | ".join(unique_items) if unique_items else "Sin Especificar"
+
+    grouped = df.groupby('Referencia de la orden', as_index=False).agg({
+        'Empresa': 'first',
+        'Estado': 'first',
+        'Semaforo': 'first',
+        'Semaforo_Importacion': 'first',
+        'Tipo_Proveedor': 'first',
+        'Proveedor': 'first',
+        'Producto': join_items,
+        'Cantidad': 'sum',
+        'Moneda': 'first',
+        'Total': 'sum',
+        'Total_MXN': 'sum',
+        'Comprador': 'first',
+        'Fecha_Limite': 'first'
+    })
+
+    return grouped
 
 # ---------------------------------------------------------
 # 2. CARGA DE SEGUIMIENTO PHILIPS (GOOGLE SHEETS / LOCAL)
@@ -405,4 +434,57 @@ def procesar_excel_config(xls):
     if 'Proyecto_Nombre' not in df_all.columns:
         df_all['Proyecto_Nombre'] = 'General'
 
+    return df_all
+
+# ---------------------------------------------------------
+# 4. CARGA DE SEGUIMIENTO DE AGENTE ADUANAL (CARGO)
+# ---------------------------------------------------------
+def load_cargo_data():
+    url_online = f"https://docs.google.com/spreadsheets/d/{GOOGLE_SHEET_CARGO_ID}/export?format=xlsx"
+    try:
+        response = requests.get(url_online, timeout=10)
+        if response.status_code == 200:
+            xls = pd.ExcelFile(io.BytesIO(response.content))
+            return procesar_excel_cargo(xls)
+    except Exception as e:
+        print(f"Aviso Google Sheets CARGO: {e}")
+
+    ruta = buscar_archivo_local([
+        "Seguimiento CARGO.xlsx",
+        "CARGO.xlsx",
+        "Seguimiento Importacion CARGO.xlsx"
+    ])
+    if not ruta or not os.path.exists(ruta):
+        return pd.DataFrame()
+
+    try:
+        xls = pd.ExcelFile(ruta)
+        return procesar_excel_cargo(xls)
+    except Exception:
+        return pd.DataFrame()
+
+def procesar_excel_cargo(xls):
+    dfs = []
+    for sheet in xls.sheet_names:
+        try:
+            df_s = pd.read_excel(xls, sheet_name=sheet)
+            if df_s.empty: continue
+            
+            if not any(c in str(df_s.columns).upper() for c in ['PEDIMENTO', 'ADUANA', 'STATUS', 'ESTATUS', 'REFERENCIA', 'PROVEEDOR', 'OC', 'CONTENEDOR', 'EMBARQUE']):
+                for h in [1, 2, 3]:
+                    df_h = pd.read_excel(xls, sheet_name=sheet, header=h)
+                    if any(c in str(df_h.columns).upper() for c in ['PEDIMENTO', 'ADUANA', 'STATUS', 'ESTATUS', 'REFERENCIA', 'PROVEEDOR', 'OC', 'CONTENEDOR', 'EMBARQUE']):
+                        df_s = df_h
+                        break
+            df_s['Origen_Hoja'] = sheet
+            dfs.append(df_s)
+        except Exception:
+            continue
+
+    df_all = pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
+    if df_all.empty:
+        return pd.DataFrame()
+
+    df_all = df_all.dropna(how='all')
+    df_all = df_all.loc[:, ~df_all.columns.duplicated(keep='first')]
     return df_all

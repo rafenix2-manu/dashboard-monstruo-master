@@ -3,7 +3,7 @@ import pandas as pd
 import streamlit as st
 import plotly.express as px
 from datetime import datetime
-from data_loader import load_po_data, load_philips_data, load_config_data, DATA_DIR, DEFAULT_ODOO_DB, DEFAULT_ODOO_USER, DEFAULT_ODOO_PASS
+from data_loader import load_po_data, load_philips_data, load_config_data, load_cargo_data, DATA_DIR, DEFAULT_ODOO_DB, DEFAULT_ODOO_USER, DEFAULT_ODOO_PASS
 
 # ---------------------------------------------------------
 # CONFIGURACIÓN DE PÁGINA Y ESTILOS
@@ -71,19 +71,17 @@ def save_uploaded_file(uploaded_file, target_filename):
 
 @st.cache_data(ttl=60)
 def cargar_todo(odoo_db=None, odoo_user=None, odoo_pass=None):
-    return load_po_data(odoo_db, odoo_user, odoo_pass), load_philips_data(), load_config_data()
+    return load_po_data(odoo_db, odoo_user, odoo_pass), load_philips_data(), load_config_data(), load_cargo_data()
 
 # ---------------------------------------------------------
 # BARRA LATERAL (CENTRO DE CONTROL)
 # ---------------------------------------------------------
 st.sidebar.title("🎛️ Centro de Control")
 
-# Session state de Odoo
 if 'odoo_db' not in st.session_state: st.session_state['odoo_db'] = DEFAULT_ODOO_DB
 if 'odoo_user' not in st.session_state: st.session_state['odoo_user'] = DEFAULT_ODOO_USER
 if 'odoo_pass' not in st.session_state: st.session_state['odoo_pass'] = DEFAULT_ODOO_PASS
 
-# 1. BOTÓN DE SINCRONIZACIÓN EN VIVO DESDE LA NUBE
 if st.sidebar.button("🔄 Sincronizar Todo en Vivo desde la Nube", type="primary", use_container_width=True):
     st.cache_data.clear()
     now_str = datetime.now().strftime("%d/%m/%Y a las %H:%M hrs")
@@ -94,7 +92,6 @@ if st.sidebar.button("🔄 Sincronizar Todo en Vivo desde la Nube", type="primar
 
 st.sidebar.markdown("---")
 
-# 2. ACCESO ADMINISTRADOR
 if 'is_admin' not in st.session_state:
     st.session_state['is_admin'] = False
 
@@ -148,6 +145,12 @@ else:
             st.success("✅ Configuraciones actualizado")
             st.rerun()
 
+        file_cargo = st.file_uploader("4. Seguimiento Agente CARGO", type=["xlsx", "xls"], key="up_cargo")
+        if file_cargo and st.button("💾 Publicar CARGO", type="primary", use_container_width=True):
+            save_uploaded_file(file_cargo, "Seguimiento CARGO.xlsx")
+            st.success("✅ CARGO actualizado")
+            st.rerun()
+
     if st.sidebar.button("Salir de Modo Admin", use_container_width=True):
         st.session_state['is_admin'] = False
         st.rerun()
@@ -160,7 +163,7 @@ if os.path.exists(METADATA_FILE):
     st.sidebar.info(f"🕒 **Última Actualización:**\n{last_update}")
 
 # Cargar Datos en Vivo
-df_po, df_philips, df_config = cargar_todo(st.session_state['odoo_db'], st.session_state['odoo_user'], st.session_state['odoo_pass'])
+df_po, df_philips, df_config, df_cargo = cargar_todo(st.session_state['odoo_db'], st.session_state['odoo_user'], st.session_state['odoo_pass'])
 
 # ---------------------------------------------------------
 # FILTROS DE SEGMENTACIÓN (PÚBLICOS)
@@ -185,18 +188,16 @@ else:
 # HEADER Y METRICAS CONSOLIDADAS GLOBAL
 # ---------------------------------------------------------
 st.title("🏢 MONSTRUO DE CONTROL TOTAL: Compras, Importaciones & Proyectos")
-st.caption("Consola unificada con sincronización automática de Odoo y Google Sheets.")
+st.caption("Consola unificada con sincronización automática de Odoo API, Philips, CARGO y Google Sheets.")
 
 if not df_po_filtered.empty and 'Referencia de la orden' in df_po_filtered.columns:
-    ordenes_unicas = df_po_filtered.groupby('Referencia de la orden').first().reset_index()
-    monto_total = ordenes_unicas['Total_MXN'].sum() if 'Total_MXN' in ordenes_unicas.columns else 0
-    vencidas_cnt = len(ordenes_unicas[ordenes_unicas['Semaforo'] == '🔴 Vencido']) if 'Semaforo' in ordenes_unicas.columns else 0
+    monto_total = df_po_filtered['Total_MXN'].sum() if 'Total_MXN' in df_po_filtered.columns else 0
+    vencidas_cnt = len(df_po_filtered[df_po_filtered['Semaforo'] == '🔴 Vencido']) if 'Semaforo' in df_po_filtered.columns else 0
     
-    imp_unicas = ordenes_unicas[ordenes_unicas['Tipo_Proveedor'].str.contains("Importación", na=False)]
+    imp_unicas = df_po_filtered[df_po_filtered['Tipo_Proveedor'].str.contains("Importación", na=False)]
     imp_cnt = len(imp_unicas)
     imp_criticas = len(imp_unicas[imp_unicas['Semaforo_Importacion'].str.contains("CRÍTICO", na=False)]) if 'Semaforo_Importacion' in imp_unicas.columns else 0
 else:
-    ordenes_unicas = pd.DataFrame()
     imp_unicas = pd.DataFrame()
     monto_total = 0
     vencidas_cnt = 0
@@ -207,7 +208,7 @@ k1, k2, k3, k4, k5 = st.columns(5)
 k1.markdown(f'<div class="kpi-card"><div class="kpi-title">Gasto Total Compras</div><div class="kpi-value">${monto_total:,.0f} <span style="font-size:0.75rem;">MXN</span></div></div>', unsafe_allow_html=True)
 k2.markdown(f'<div class="kpi-card"><div class="kpi-title">🔴 Entregas Vencidas</div><div class="kpi-value" style="color:#dc2626;">{vencidas_cnt:,}</div></div>', unsafe_allow_html=True)
 k3.markdown(f'<div class="kpi-card"><div class="kpi-title">🚢 OCs Importación</div><div class="kpi-value" style="color:#0284c7;">{imp_cnt:,}</div></div>', unsafe_allow_html=True)
-k4.markdown(f'<div class="kpi-card"><div class="kpi-title">🚨 Import. Críticas</div><div class="kpi-value" style="color:#b91c1c;">{imp_criticas:,}</div></div>', unsafe_allow_html=True)
+k4.markdown(f'<div class="kpi-card"><div class="kpi-title">📦 Embarques CARGO</div><div class="kpi-value" style="color:#d97706;">{get_safe_len(df_cargo):,}</div></div>', unsafe_allow_html=True)
 k5.markdown(f'<div class="kpi-card"><div class="kpi-title">Proyectos Activos</div><div class="kpi-value">{get_safe_nunique(df_config, "Proyecto_Nombre")}</div></div>', unsafe_allow_html=True)
 
 st.markdown("<br>", unsafe_allow_html=True)
@@ -221,16 +222,16 @@ def render_detalle_por_empresa(df_base, prefix_key="gen"):
 
     empresas_list = list(df_base['Empresa'].unique()) if 'Empresa' in df_base.columns else []
     
-    st.markdown("### 🏢 Selecciona una Empresa para ver el Detalle de sus Órdenes de Compra:")
+    st.markdown("### 🏢 Selecciona una Empresa para ver sus Órdenes de Compra Unificadas:")
     
     tab_titles = ["🏢 TODAS LAS EMPRESAS (" + str(df_base['Referencia de la orden'].nunique()) + " OCs)"] + [f"🏢 {emp} ({df_base[df_base['Empresa']==emp]['Referencia de la orden'].nunique()} OCs)" for emp in empresas_list]
     tabs = st.tabs(tab_titles)
 
     with tabs[0]:
-        st.markdown("#### 📋 Detalle Consolidado de Todas las Empresas")
+        st.markdown("#### 📋 Detalle Consolidado de Todas las Empresas (1 Renglón por OC)")
         c_f1, c_f2 = st.columns([2, 1])
         with c_f1:
-            q_search = st.text_input("🔍 Buscar por OC, Proveedor o Producto:", "", key=f"{prefix_key}_search_all")
+            q_search = st.text_input("🔍 Buscar por Folio de OC, Proveedor o Producto:", "", key=f"{prefix_key}_search_all")
         with c_f2:
             sem_filter = st.selectbox("Filtrar por Semáforo:", ["TODOS"] + list(df_base['Semaforo'].unique()), key=f"{prefix_key}_sem_all")
 
@@ -258,7 +259,7 @@ def render_detalle_por_empresa(df_base, prefix_key="gen"):
 
             e1, e2, e3, e4 = st.columns(4)
             e1.markdown(f'<div class="kpi-card"><div class="kpi-title">Monto Total ({emp_name})</div><div class="kpi-value">${m_emp:,.0f} MXN</div></div>', unsafe_allow_html=True)
-            e2.markdown(f'<div class="kpi-card"><div class="kpi-title">Total Órdenes</div><div class="kpi-value">{cnt_emp:,}</div></div>', unsafe_allow_html=True)
+            e2.markdown(f'<div class="kpi-card"><div class="kpi-title">Total Órdenes Unificadas</div><div class="kpi-value">{cnt_emp:,}</div></div>', unsafe_allow_html=True)
             e3.markdown(f'<div class="kpi-card"><div class="kpi-title">🔴 Órdenes Vencidas</div><div class="kpi-value" style="color:#dc2626;">{venc_emp:,}</div></div>', unsafe_allow_html=True)
             e4.markdown(f'<div class="kpi-card"><div class="kpi-title">🚢 Importación</div><div class="kpi-value" style="color:#0284c7;">{imp_emp:,}</div></div>', unsafe_allow_html=True)
 
@@ -286,7 +287,7 @@ def render_detalle_por_empresa(df_base, prefix_key="gen"):
 # ---------------------------------------------------------
 t1, t2, t3, t4, t5 = st.tabs([
     "📊 1. Control General por Empresas (Odoo POs)",
-    "🚢 2. Control de Importaciones & Aduanas",
+    "🚢 2. Control de Importaciones & Agente Aduanal (CARGO)",
     "💙 3. Tracking Especial Philips",
     "⚙️ 4. Pendientes & Configuraciones 2026",
     "🔀 5. Matriz Cruzada & Auditoría Unificada"
@@ -300,8 +301,8 @@ with t1:
         c1, c2 = st.columns(2)
         with c1:
             st.subheader("Semáforo General de Entregas")
-            if not ordenes_unicas.empty and 'Semaforo' in ordenes_unicas.columns:
-                df_sem = ordenes_unicas['Semaforo'].value_counts().reset_index()
+            if not df_po_filtered.empty and 'Semaforo' in df_po_filtered.columns:
+                df_sem = df_po_filtered['Semaforo'].value_counts().reset_index()
                 df_sem.columns = ['Semaforo', 'Cantidad']
                 fig_sem = px.pie(df_sem, names='Semaforo', values='Cantidad', hole=0.45, color='Semaforo',
                                  color_discrete_map={"🔴 Vencido": "#ef4444", "🟡 Próximo a Vencer (<=7 días)": "#f59e0b", "🟢 A Tiempo": "#10b981", "⚪ Sin Fecha": "#94a3b8", "⚪ Inactivo / Creado": "#cbd5e1"})
@@ -316,59 +317,89 @@ with t1:
         st.markdown("---")
         render_detalle_por_empresa(df_po_filtered, prefix_key="tab1")
 
-# TAB 2: IMPORTACIONES
+# TAB 2: IMPORTACIONES & CARGO
 with t2:
-    st.subheader("🚢 Control Especial de Importaciones, Aduanas & Alertas de Acción")
-    if imp_unicas.empty:
-        st.info("No hay órdenes de compra de importación seleccionadas.")
-    else:
-        st.markdown("### 📢 Avisos de Acción Inmediata para Compras")
-        criticas_df = imp_unicas[imp_unicas['Semaforo_Importacion'].str.contains("CRÍTICO", na=False)]
-        urgentes_df = imp_unicas[imp_unicas['Semaforo_Importacion'].str.contains("URGENTE", na=False)]
-        
-        if not criticas_df.empty:
-            st.markdown(f"""
-                <div class="alert-box-red">
-                    <strong>🚨 ALERTA CRÍTICA DE ADUANA / DOCUMENTACIÓN ({len(criticas_df)} Órdenes Vencidas):</strong><br>
-                    Existen órdenes de compra internacionales cuya fecha límite expiró. 
-                    <strong>Acciones requeridas:</strong> Contactar al fabricante/agente aduanal, solicitar estatus del despacho aduanal y verificar la entrega de Pedimentos y Cartas de Fabricación.
-                </div>
-            """, unsafe_allow_html=True)
+    st.subheader("🚢 Control Unificado de Importaciones, Aduanas & Agente Aduanal CARGO")
+    
+    tab_imp1, tab_imp2 = st.tabs([
+        "📦 Tracking Agente Aduanal (CARGO Google Sheet)",
+        "📋 Control de Órdenes de Compra de Importación (Odoo)"
+    ])
 
-        if not urgentes_df.empty:
-            st.markdown(f"""
-                <div class="alert-box-yellow">
-                    <strong>⚠️ AVISO DE VENCIMIENTO PRÓXIMO ({len(urgentes_df)} Órdenes por vencer en ≤7 días):</strong><br>
-                    <strong>Acciones requeridas:</strong> Exigir al proveedor la Factura Ciega, Confirmación de Embarque y coordinar el ingreso a Almacén 11.
-                </div>
-            """, unsafe_allow_html=True)
+    with tab_imp1:
+        st.markdown("### 📦 Seguimiento de Operaciones Aduanales y Embarques (Agente CARGO)")
+        if df_cargo.empty:
+            st.info("💡 Cargando o sin datos disponibles en la hoja de seguimiento CARGO.")
+        else:
+            cg1, cg2 = st.columns(2)
+            with cg1:
+                st.metric("Total Embarques / Operaciones Registradas", f"{len(df_cargo):,}")
+            with cg2:
+                hojas_count = df_cargo['Origen_Hoja'].nunique() if 'Origen_Hoja' in df_cargo.columns else 1
+                st.metric("Pestañas / Secciones en Hoja CARGO", f"{hojas_count}")
 
-        ci1, ci2 = st.columns(2)
-        with ci1:
-            st.subheader("Semáforo de Importaciones")
-            df_imp_sem = imp_unicas['Semaforo_Importacion'].value_counts().reset_index()
-            df_imp_sem.columns = ['Estatus_Import', 'Cantidad']
-            map_colors_imp = {
-                "🚨 CRÍTICO: Vencido (Atraso Aduana/Doc)": "#dc2626",
-                "⚠️ URGENTE: Vence ≤7 días (Solicitar Pedimento)": "#f59e0b",
-                "🟡 PRECAUCIÓN: Próximo 8-15 días (Validar Doc)": "#eab308",
-                "🟢 EN TIEMPO (>15 días)": "#16a34a",
-                "⚪ Inactivo / Creado": "#cbd5e1"
-            }
-            fig_imp_sem = px.bar(df_imp_sem, x='Estatus_Import', y='Cantidad', color='Estatus_Import',
-                                 color_discrete_map=map_colors_imp, text_auto=True)
-            fig_imp_sem.update_layout(showlegend=False, xaxis_title="", yaxis_title="Órdenes")
-            st.plotly_chart(fig_imp_sem, use_container_width=True)
+            st.markdown("---")
+            q_cargo = st.text_input("🔍 Buscar en Tracking CARGO (Pedimento, Contenedor, Referencia, OC, Proveedor):", "", key="search_cargo")
+            df_cargo_view = df_cargo.copy()
+            if q_cargo:
+                cond_c = pd.Series(False, index=df_cargo_view.index)
+                for col in df_cargo_view.columns:
+                    cond_c |= df_cargo_view[col].astype(str).str.contains(q_cargo, case=False, na=False)
+                df_cargo_view = df_cargo_view[cond_c]
 
-        with ci2:
-            st.subheader("Gasto por Proveedor Extranjero")
-            df_prov_imp = imp_unicas.groupby('Proveedor')['Total_MXN'].sum().reset_index().sort_values('Total_MXN', ascending=True)
-            fig_prov_imp = px.bar(df_prov_imp, x='Total_MXN', y='Proveedor', orientation='h', text_auto='.2s', color='Total_MXN', color_continuous_scale='Reds')
-            st.plotly_chart(fig_prov_imp, use_container_width=True)
+            st.dataframe(df_cargo_view, use_container_width=True)
 
-        st.markdown("---")
-        df_imp_all = df_po_filtered[df_po_filtered['Tipo_Proveedor'].str.contains("Importación", na=False)]
-        render_detalle_por_empresa(df_imp_all, prefix_key="tab2_imp")
+    with tab_imp2:
+        if imp_unicas.empty:
+            st.info("No hay órdenes de compra de importación seleccionadas.")
+        else:
+            st.markdown("### 📢 Avisos de Acción Inmediata para Compras Internacionales")
+            criticas_df = imp_unicas[imp_unicas['Semaforo_Importacion'].str.contains("CRÍTICO", na=False)]
+            urgentes_df = imp_unicas[imp_unicas['Semaforo_Importacion'].str.contains("URGENTE", na=False)]
+            
+            if not criticas_df.empty:
+                st.markdown(f"""
+                    <div class="alert-box-red">
+                        <strong>🚨 ALERTA CRÍTICA DE ADUANA / DOCUMENTACIÓN ({len(criticas_df)} Órdenes Vencidas):</strong><br>
+                        Existen órdenes de compra internacionales cuya fecha límite expiró. 
+                        <strong>Acciones requeridas:</strong> Contactar al agente aduanal CARGO / fabricante, solicitar estatus del despacho aduanal y verificar Pedimento / Factura Ciega.
+                    </div>
+                """, unsafe_allow_html=True)
+
+            if not urgentes_df.empty:
+                st.markdown(f"""
+                    <div class="alert-box-yellow">
+                        <strong>⚠️ AVISO DE VENCIMIENTO PRÓXIMO ({len(urgentes_df)} Órdenes por vencer en ≤7 días):</strong><br>
+                        <strong>Acciones requeridas:</strong> Exigir al proveedor la Factura Ciega, Confirmación de Embarque y coordinar el ingreso a Almacén.
+                    </div>
+                """, unsafe_allow_html=True)
+
+            ci1, ci2 = st.columns(2)
+            with ci1:
+                st.subheader("Semáforo de Importaciones")
+                df_imp_sem = imp_unicas['Semaforo_Importacion'].value_counts().reset_index()
+                df_imp_sem.columns = ['Estatus_Import', 'Cantidad']
+                map_colors_imp = {
+                    "🚨 CRÍTICO: Vencido (Atraso Aduana/Doc)": "#dc2626",
+                    "⚠️ URGENTE: Vence ≤7 días (Solicitar Pedimento)": "#f59e0b",
+                    "🟡 PRECAUCIÓN: Próximo 8-15 días (Validar Doc)": "#eab308",
+                    "🟢 EN TIEMPO (>15 días)": "#16a34a",
+                    "⚪ Inactivo / Creado": "#cbd5e1"
+                }
+                fig_imp_sem = px.bar(df_imp_sem, x='Estatus_Import', y='Cantidad', color='Estatus_Import',
+                                     color_discrete_map=map_colors_imp, text_auto=True)
+                fig_imp_sem.update_layout(showlegend=False, xaxis_title="", yaxis_title="Órdenes")
+                st.plotly_chart(fig_imp_sem, use_container_width=True)
+
+            with ci2:
+                st.subheader("Gasto por Proveedor Extranjero")
+                df_prov_imp = imp_unicas.groupby('Proveedor')['Total_MXN'].sum().reset_index().sort_values('Total_MXN', ascending=True)
+                fig_prov_imp = px.bar(df_prov_imp, x='Total_MXN', y='Proveedor', orientation='h', text_auto='.2s', color='Total_MXN', color_continuous_scale='Reds')
+                st.plotly_chart(fig_prov_imp, use_container_width=True)
+
+            st.markdown("---")
+            df_imp_all = df_po_filtered[df_po_filtered['Tipo_Proveedor'].str.contains("Importación", na=False)]
+            render_detalle_por_empresa(df_imp_all, prefix_key="tab2_imp")
 
 # TAB 3: PHILIPS
 with t3:
@@ -425,9 +456,9 @@ with t4:
 # TAB 5: MATRIZ CRUZADA & AUDITORÍA
 with t5:
     st.subheader("🔀 Matriz Cruzada & Auditoría Operativa Unificada")
-    st.markdown("Busca cualquier **Orden de Compra**, **Proyecto** o **Equipo** para ver su estatus simultáneo:")
+    st.markdown("Busca cualquier **Orden de Compra**, **Pedimento**, **Proyecto** o **Equipo** para ver su estatus simultáneo:")
     
-    query = st.text_input("🔍 Ingresa número de OC (ej. MAN01120, MPC05458) o Nombre de Proyecto:", "")
+    query = st.text_input("🔍 Ingresa número de OC (ej. MAN01120, MPC05458), Pedimento o Proyecto:", "")
     if query:
         st.markdown("### 1. Coincidencias en Órdenes de Compra (Odoo):")
         if not df_po.empty and 'Referencia de la orden' in df_po.columns:
@@ -435,7 +466,14 @@ with t5:
             cols_show = [c for c in COLS_PO_SHOW if c in m_po.columns]
             st.dataframe(m_po[cols_show], use_container_width=True)
             
-        st.markdown("### 2. Coincidencias en Tracking Philips:")
+        st.markdown("### 2. Coincidencias en Tracking Agente Aduanal (CARGO):")
+        if not df_cargo.empty:
+            cond_c = pd.Series(False, index=df_cargo.index)
+            for col in df_cargo.columns:
+                cond_c |= df_cargo[col].astype(str).str.contains(query, case=False, na=False)
+            st.dataframe(df_cargo[cond_c], use_container_width=True)
+
+        st.markdown("### 3. Coincidencias en Tracking Philips:")
         if not df_philips.empty:
             cond_phil = pd.Series(False, index=df_philips.index)
             if 'Orden_Compra' in df_philips.columns:
@@ -444,7 +482,7 @@ with t5:
                 cond_phil |= df_philips['Proyecto'].astype(str).str.contains(query, case=False, na=False)
             st.dataframe(df_philips[cond_phil], use_container_width=True)
             
-        st.markdown("### 3. Coincidencias en Configuraciones 2026:")
+        st.markdown("### 4. Coincidencias en Configuraciones 2026:")
         if not df_config.empty:
             cond_cfg = pd.Series(False, index=df_config.index)
             if 'Orden_Compra' in df_config.columns:
