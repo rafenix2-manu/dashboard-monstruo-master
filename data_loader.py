@@ -37,27 +37,51 @@ def clasificar_proveedor(nombre_proveedor):
             return "🚢 Importación (Requiere Doc)"
     return "🇲🇽 Nacional"
 
-def calcular_semaforo(row, fecha_referencia):
-    if pd.isna(row.get('Fecha_Limite')):
-        return "⚪ Sin Fecha"
-    if str(row.get('Estado')) in ['Cancelado', 'Bloqueado', 'cancel']:
-        return "⚪ Inactivo / Creado"
+def calcular_semaforo_recepcion(estado_general, qty_ord, qty_rec, fecha_limite, fecha_referencia):
+    # Evaluador inteligente de entregas
+    if str(estado_general) in ['Cancelado', 'cancel']:
+        return "⚫ Cancelado"
+    
+    q_ord = pd.to_numeric(qty_ord, errors='coerce')
+    q_rec = pd.to_numeric(qty_rec, errors='coerce')
+    q_ord = 0 if pd.isna(q_ord) else q_ord
+    q_rec = 0 if pd.isna(q_rec) else q_rec
+
+    if q_ord > 0 and q_rec >= q_ord:
+        return "🟢 Recibido Totalmente"
         
-    dias_diferencia = (row['Fecha_Limite'].date() - fecha_referencia).days
+    if q_rec > 0 and q_rec < q_ord:
+        if pd.isna(fecha_limite):
+            return "🔵 Recibido Parcial (Sin Fecha)"
+        dias = (fecha_limite.date() - fecha_referencia).days
+        if dias < 0:
+            return "🔴 Atraso en Saldo Pendiente"
+        return "🔵 Recibido Parcial (En tiempo)"
+
+    if pd.isna(fecha_limite):
+        return "⚪ Sin Fecha"
+        
+    dias_diferencia = (fecha_limite.date() - fecha_referencia).days
     if dias_diferencia < 0:
-        return "🔴 Vencido"
+        return "🔴 Vencido (No Recibido)"
     elif 0 <= dias_diferencia <= 7:
         return "🟡 Próximo a Vencer (<=7 días)"
     else:
-        return "🟢 A Tiempo"
+        return "🟢 A Tiempo (En tránsito)"
+
 
 def calcular_semaforo_importacion(row, fecha_referencia):
     if str(row.get('Tipo_Proveedor')) == "🇲🇽 Nacional":
         return "🇲🇽 Nacional"
+        
+    sem_gral = str(row.get('Semaforo', ''))
+    if "Recibido Totalmente" in sem_gral:
+        return "🟢 RECIBIDO TOTALMENTE EN ADUANA/ALMACEN"
+    if "Cancelado" in sem_gral:
+        return "⚫ Cancelado"
+        
     if pd.isna(row.get('Fecha_Limite')):
         return "⚪ Sin Fecha Límite"
-    if str(row.get('Estado')) in ['Cancelado', 'Bloqueado', 'cancel']:
-        return "⚪ Inactivo / Creado"
         
     dias = (row['Fecha_Limite'].date() - fecha_referencia).days
     if dias < 0:
@@ -79,7 +103,7 @@ def buscar_archivo_local(nombres_posibles):
     return None
 
 # ---------------------------------------------------------
-# 1. CARGA EXCLUSIVA DEL MÓDULO DE COMPRAS ODOO
+# 1. CARGA EXCLUSIVA DEL MÓDULO DE COMPRAS ODOO (API / EXCEL)
 # ---------------------------------------------------------
 def load_po_data(odoo_db=None, odoo_user=None, odoo_password=None):
     db = odoo_db if odoo_db else DEFAULT_ODOO_DB
@@ -122,6 +146,8 @@ def fetch_odoo_live(db, user, password):
             return None
 
         models = xmlrpc.client.ServerProxy(f'{ODOO_URL}/xmlrpc/2/object')
+        
+        # Leemos TODO excepto canceladas para consolidar bien
         po_domain = [('state', '!=', 'cancel')]
         po_ids = models.execute_kw(db, uid, password, 'purchase.order', 'search', [po_domain])
         
@@ -149,7 +175,8 @@ def fetch_odoo_live(db, user, password):
 
         line_ids = models.execute_kw(db, uid, password, 'purchase.order.line', 'search', [[('order_id', 'in', po_ids)]])
         if line_ids:
-            line_fields = ['order_id', 'product_id', 'name', 'product_qty', 'price_unit', 'price_subtotal', 'date_planned']
+            # Extraemos explicitamente qty_received para calcular entregas parciales/totales
+            line_fields = ['order_id', 'product_id', 'name', 'product_qty', 'qty_received', 'price_unit', 'price_subtotal', 'date_planned']
             lines = models.execute_kw(db, uid, password, 'purchase.order.line', 'read', [line_ids], {'fields': line_fields})
             
             rows = []
@@ -163,24 +190,45 @@ def fetch_odoo_live(db, user, password):
                     continue
 
                 prod_tuple = line.get('product_id')
-                prod_name = prod_tuple[1] if isinstance(prod_tuple, (list, tuple)) else str(line.get('name', 'Sin Especificar'))
+                # Guardamos la descripcion larga para la tabla estilo odoo
+                prod_desc_full = str(line.get('name', 'Sin Especificar'))
 
                 rows.append({
                     'Referencia de la orden': po_info['po_name'],
                     'Proveedor': po_info['vendor'],
                     'Comprador': po_info['buyer'],
                     'Empresa': po_info['company'],
-                    'Estado': po_info['state'],
+                    'Estado_Odoo': po_info['state'],
                     'Fecha límite de la orden': line.get('date_planned') or po_info['date_planned'],
-                    'Producto': prod_name,
+                    'Producto': prod_desc_full,
                     'Cantidad': line.get('product_qty', 1),
-                    'Precio Unitario': line.get('price_unit', 0),
+                    'Recibido': line.get('qty_received', 0),
+                    'Precio_Unitario': line.get('price_unit', 0),
                     'Total': line.get('price_subtotal', 0),
                     'Moneda': po_info['currency']
                 })
             
             if rows:
                 return procesar_df_po(pd.DataFrame(rows))
+
+        # Backup si no hay líneas
+        rows = []
+        for p_id, po_info in po_dict.items():
+            rows.append({
+                'Referencia de la orden': po_info['po_name'],
+                'Proveedor': po_info['vendor'],
+                'Comprador': po_info['buyer'],
+                'Empresa': po_info['company'],
+                'Estado_Odoo': po_info['state'],
+                'Fecha límite de la orden': po_info['date_planned'],
+                'Producto': 'Consolidado Compras',
+                'Cantidad': 1,
+                'Recibido': 0,
+                'Precio_Unitario': po_info['amount_total'],
+                'Total': po_info['amount_total'],
+                'Moneda': po_info['currency']
+            })
+        return procesar_df_po(pd.DataFrame(rows))
 
     except Exception as e:
         print(f"Aviso API Odoo: {e}")
@@ -192,13 +240,21 @@ def procesar_df_po(df_in):
 
     df = df_in.copy()
 
+    if 'Referencia de la orden' in df.columns and 'Total' in df.columns:
+        df = df.dropna(subset=['Referencia de la orden'], how='all')
+
     df['Referencia de la orden'] = df['Referencia de la orden'].ffill().fillna('Sin Ref')
     df['Comprador'] = df['Comprador'].ffill().fillna('Sin Asignar')
     df['Empresa'] = df['Empresa'].ffill().fillna('Sin Empresa')
     df['Proveedor'] = df['Proveedor'].ffill().fillna('Sin Proveedor')
-    df['Estado'] = df['Estado'].fillna('Sin Estado')
     df['Moneda'] = df['Moneda'].fillna('MXN')
     df['Producto'] = df['Producto'].fillna('Sin Especificar')
+    
+    if 'Recibido' not in df.columns: df['Recibido'] = 0
+    if 'Precio_Unitario' not in df.columns: df['Precio_Unitario'] = 0
+    if 'Estado_Odoo' not in df.columns and 'Estado' in df.columns: df['Estado_Odoo'] = df['Estado']
+    
+    df['Estado_Odoo'] = df['Estado_Odoo'].fillna('Sin Estado')
 
     estado_map = {
         'draft': 'Solicitud de cotización',
@@ -208,27 +264,31 @@ def procesar_df_po(df_in):
         'done': 'Bloqueado / Hecho',
         'cancel': 'Cancelado'
     }
-    df['Estado'] = df['Estado'].replace(estado_map)
+    df['Estado'] = df['Estado_Odoo'].replace(estado_map)
 
     tasas = {'MXN': 1.0, 'USD': 17.50, 'EUR': 19.00, 'GBP': 22.00}
     df['Total'] = pd.to_numeric(df['Total'] if 'Total' in df.columns else 0, errors='coerce').fillna(0)
+    df['Precio_Unitario'] = pd.to_numeric(df['Precio_Unitario'], errors='coerce').fillna(0)
     df['Total_MXN'] = df.apply(lambda r: r['Total'] * tasas.get(str(r['Moneda']).upper(), 1.0), axis=1)
     
-    cant_col = 'Producto/Cantidad de material' if 'Producto/Cantidad de material' in df.columns else 'Cantidad'
-    df['Cantidad'] = pd.to_numeric(df[cant_col] if cant_col in df.columns else 1, errors='coerce').fillna(1)
+    cant_col = 'Cantidad' if 'Cantidad' in df.columns else ('Producto/Cantidad de material' if 'Producto/Cantidad de material' in df.columns else 'Cantidad')
+    df['Cantidad'] = pd.to_numeric(df[cant_col], errors='coerce').fillna(1)
+    df['Recibido'] = pd.to_numeric(df['Recibido'], errors='coerce').fillna(0)
     
     df['Tipo_Proveedor'] = df['Proveedor'].apply(clasificar_proveedor)
     fecha_col = 'Fecha límite de la orden' if 'Fecha límite de la orden' in df.columns else 'Fecha'
     df['Fecha_Limite'] = pd.to_datetime(df[fecha_col] if fecha_col in df.columns else None, errors='coerce')
     
     fecha_ref = date(2026, 9, 8)
-    df['Semaforo'] = df.apply(lambda r: calcular_semaforo(r, fecha_ref), axis=1)
+    
+    # Nuevo semaforo basado en cantidades recibidas vs pedidas
+    df['Semaforo'] = df.apply(lambda r: calcular_semaforo_recepcion(r['Estado_Odoo'], r['Cantidad'], r['Recibido'], r['Fecha_Limite'], fecha_ref), axis=1)
     df['Semaforo_Importacion'] = df.apply(lambda r: calcular_semaforo_importacion(r, fecha_ref), axis=1)
 
     return df
 
 # ---------------------------------------------------------
-# 2. CARGA DE SEGUIMIENTO PHILIPS
+# CARGA DE PHILIPS, CONFIG Y CARGO (Logica compartida intacta)
 # ---------------------------------------------------------
 def load_philips_data():
     url_online = f"https://docs.google.com/spreadsheets/d/{GOOGLE_SHEET_PHILIPS_ID}/export?format=xlsx"
@@ -237,21 +297,12 @@ def load_philips_data():
         if response.status_code == 200:
             xls = pd.ExcelFile(io.BytesIO(response.content))
             return procesar_excel_philips(xls)
-    except Exception as e:
-        print(f"Aviso Google Sheets Philips: {e}")
-
-    ruta = buscar_archivo_local([
-        "Seguimiento Philips _ MPC - Ordenes de compra.xlsx",
-        "Seguimiento Philips _ MPC - Ordenes de compra_2.xlsx"
-    ])
-    if not ruta or not os.path.exists(ruta):
-        return pd.DataFrame()
-
-    try:
-        xls = pd.ExcelFile(ruta)
-        return procesar_excel_philips(xls)
-    except Exception:
-        return pd.DataFrame()
+    except Exception: pass
+    ruta = buscar_archivo_local(["Seguimiento Philips _ MPC - Ordenes de compra.xlsx", "Seguimiento Philips _ MPC - Ordenes de compra_2.xlsx"])
+    if ruta and os.path.exists(ruta):
+        try: return procesar_excel_philips(pd.ExcelFile(ruta))
+        except Exception: pass
+    return pd.DataFrame()
 
 def procesar_excel_philips(xls):
     dfs = []
@@ -261,18 +312,14 @@ def procesar_excel_philips(xls):
             df1 = pd.read_excel(xls, sheet_name='Hoja 1', header=3)
         df1['Origen_Hoja'] = 'General Philips'
         dfs.append(df1)
-        
     for sheet in xls.sheet_names:
         if sheet in ['Hoja 10', 'Q1 - 2025', 'Hoja 8', 'Hoja 6']:
             h = 1 if sheet in ['Q1 - 2025', 'Hoja 6'] else 0
             df_s = pd.read_excel(xls, sheet_name=sheet, header=h)
             df_s['Origen_Hoja'] = sheet
             dfs.append(df_s)
-            
     df_all = pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
-    if df_all.empty:
-        return pd.DataFrame()
-    
+    if df_all.empty: return pd.DataFrame()
     new_cols = []
     for col in df_all.columns:
         c_str = str(col).strip()
@@ -283,46 +330,28 @@ def procesar_excel_philips(xls):
         elif 'Cantidad' in c_str: new_cols.append('Cantidad')
         elif 'Empresa' in c_str: new_cols.append('Empresa')
         else: new_cols.append(col)
-
     df_all.columns = new_cols
     df_all = df_all.loc[:, ~df_all.columns.duplicated(keep='first')]
-
     if 'Estatus' not in df_all.columns: df_all['Estatus'] = 'Sin Estatus'
     else: df_all['Estatus'] = df_all['Estatus'].fillna('Sin Estatus').astype(str)
-    
     if 'Orden_Compra' not in df_all.columns: df_all['Orden_Compra'] = 'Sin OC'
     else: df_all['Orden_Compra'] = df_all['Orden_Compra'].fillna('Sin OC').astype(str)
-    
     if 'Proyecto' not in df_all.columns: df_all['Proyecto'] = 'Sin Proyecto'
     else: df_all['Proyecto'] = df_all['Proyecto'].fillna('Sin Proyecto').astype(str)
-    
     return df_all
 
-# ---------------------------------------------------------
-# 3. CARGA DE CONFIGURACIONES 2026
-# ---------------------------------------------------------
 def load_config_data():
     url_online = f"https://docs.google.com/spreadsheets/d/{GOOGLE_SHEET_CONFIG_ID}/export?format=xlsx"
     try:
         response = requests.get(url_online, timeout=10)
         if response.status_code == 200:
-            xls = pd.ExcelFile(io.BytesIO(response.content))
-            return procesar_excel_config(xls)
-    except Exception as e:
-        print(f"Aviso Google Sheets Config: {e}")
-
-    ruta = buscar_archivo_local([
-        "PENDIENTES _ CONFIGURACIONES 2026.xlsx",
-        "PENDIENTES _ CONFIGURACIONES 2026_2.xlsx"
-    ])
-    if not ruta or not os.path.exists(ruta):
-        return pd.DataFrame()
-
-    try:
-        xls = pd.ExcelFile(ruta)
-        return procesar_excel_config(xls)
-    except Exception:
-        return pd.DataFrame()
+            return procesar_excel_config(pd.ExcelFile(io.BytesIO(response.content)))
+    except Exception: pass
+    ruta = buscar_archivo_local(["PENDIENTES _ CONFIGURACIONES 2026.xlsx", "PENDIENTES _ CONFIGURACIONES 2026_2.xlsx"])
+    if ruta and os.path.exists(ruta):
+        try: return procesar_excel_config(pd.ExcelFile(ruta))
+        except Exception: pass
+    return pd.DataFrame()
 
 def procesar_excel_config(xls):
     project_dfs = []
@@ -330,7 +359,6 @@ def procesar_excel_config(xls):
         if sheet_name in ['DASHBOARD', 'Hoja 30', 'Hoja 31']: continue
         df_s = pd.read_excel(xls, sheet_name=sheet_name)
         if df_s.empty: continue
-        
         header_found = None
         if 'DESCRIPCIÓN' in df_s.columns or 'PROVEEDOR' in df_s.columns or 'CANTIDAD' in df_s.columns:
             header_found = 0
@@ -341,58 +369,31 @@ def procesar_excel_config(xls):
                     df_s = df_s_h
                     header_found = h
                     break
-                    
         if header_found is not None:
             df_s['Proyecto_Nombre'] = sheet_name
             project_dfs.append(df_s)
-            
     df_all = pd.concat(project_dfs, ignore_index=True) if project_dfs else pd.DataFrame()
-    if df_all.empty:
-        return pd.DataFrame()
-
-    col_map = {
-        'DESCRIPCIÓN': 'Descripcion', 'CANTIDAD': 'Cantidad', 'PROVEEDOR': 'Proveedor',
-        'MARCA': 'Marca', 'MODELO': 'Modelo', 'ESTATUS': 'Estatus', 'COSTO': 'Costo',
-        'MONEDA COSTO': 'Moneda', 'PEDIDO': 'Pedido', 'OC': 'Orden_Compra', 'OBSERVACIONES': 'Observaciones'
-    }
+    if df_all.empty: return pd.DataFrame()
+    col_map = {'DESCRIPCIÓN': 'Descripcion', 'CANTIDAD': 'Cantidad', 'PROVEEDOR': 'Proveedor', 'MARCA': 'Marca', 'MODELO': 'Modelo', 'ESTATUS': 'Estatus', 'OC': 'Orden_Compra'}
     df_all.rename(columns=col_map, inplace=True)
     df_all = df_all.loc[:, ~df_all.columns.duplicated(keep='first')]
-
-    if 'Estatus' in df_all.columns:
-        df_all['Estatus'] = df_all['Estatus'].fillna('PENDIENTES / SIN ESTATUS').astype(str)
-    else:
-        df_all['Estatus'] = 'PENDIENTES / SIN ESTATUS'
-        
-    if 'Proyecto_Nombre' not in df_all.columns:
-        df_all['Proyecto_Nombre'] = 'General'
-
+    if 'Estatus' in df_all.columns: df_all['Estatus'] = df_all['Estatus'].fillna('PENDIENTES / SIN ESTATUS').astype(str)
+    else: df_all['Estatus'] = 'PENDIENTES / SIN ESTATUS'
+    if 'Proyecto_Nombre' not in df_all.columns: df_all['Proyecto_Nombre'] = 'General'
     return df_all
 
-# ---------------------------------------------------------
-# 4. CARGA DE SEGUIMIENTO AGENTE ADUANAL (CARGO)
-# ---------------------------------------------------------
 def load_cargo_data():
     url_online = f"https://docs.google.com/spreadsheets/d/{GOOGLE_SHEET_CARGO_ID}/export?format=xlsx"
     try:
         response = requests.get(url_online, timeout=10)
         if response.status_code == 200:
-            xls = pd.ExcelFile(io.BytesIO(response.content))
-            return procesar_excel_cargo(xls)
-    except Exception as e:
-        print(f"Aviso Google Sheets CARGO: {e}")
-
-    ruta = buscar_archivo_local([
-        "Seguimiento CARGO.xlsx",
-        "CARGO.xlsx"
-    ])
-    if not ruta or not os.path.exists(ruta):
-        return pd.DataFrame()
-
-    try:
-        xls = pd.ExcelFile(ruta)
-        return procesar_excel_cargo(xls)
-    except Exception:
-        return pd.DataFrame()
+            return procesar_excel_cargo(pd.ExcelFile(io.BytesIO(response.content)))
+    except Exception: pass
+    ruta = buscar_archivo_local(["Seguimiento CARGO.xlsx", "CARGO.xlsx"])
+    if ruta and os.path.exists(ruta):
+        try: return procesar_excel_cargo(pd.ExcelFile(ruta))
+        except Exception: pass
+    return pd.DataFrame()
 
 def procesar_excel_cargo(xls):
     dfs = []
@@ -400,22 +401,16 @@ def procesar_excel_cargo(xls):
         try:
             df_s = pd.read_excel(xls, sheet_name=sheet)
             if df_s.empty: continue
-            
-            if not any(c in str(df_s.columns).upper() for c in ['PEDIMENTO', 'ADUANA', 'STATUS', 'ESTATUS', 'REFERENCIA', 'PROVEEDOR', 'OC', 'CONTENEDOR', 'EMBARQUE']):
+            if not any(c in str(df_s.columns).upper() for c in ['PEDIMENTO', 'ADUANA', 'STATUS', 'ESTATUS', 'REFERENCIA', 'PROVEEDOR', 'OC', 'CONTENEDOR']):
                 for h in [1, 2, 3]:
                     df_h = pd.read_excel(xls, sheet_name=sheet, header=h)
-                    if any(c in str(df_h.columns).upper() for c in ['PEDIMENTO', 'ADUANA', 'STATUS', 'ESTATUS', 'REFERENCIA', 'PROVEEDOR', 'OC', 'CONTENEDOR', 'EMBARQUE']):
+                    if any(c in str(df_h.columns).upper() for c in ['PEDIMENTO', 'ADUANA', 'STATUS', 'ESTATUS', 'REFERENCIA', 'PROVEEDOR', 'OC', 'CONTENEDOR']):
                         df_s = df_h
                         break
             df_s['Origen_Hoja'] = sheet
             dfs.append(df_s)
-        except Exception:
-            continue
-
+        except Exception: continue
     df_all = pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
-    if df_all.empty:
-        return pd.DataFrame()
-
-    df_all = df_all.dropna(how='all')
-    df_all = df_all.loc[:, ~df_all.columns.duplicated(keep='first')]
+    if df_all.empty: return pd.DataFrame()
+    df_all = df_all.dropna(how='all').loc[:, ~df_all.columns.duplicated(keep='first')]
     return df_all

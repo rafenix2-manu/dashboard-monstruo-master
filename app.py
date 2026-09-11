@@ -40,6 +40,9 @@ st.markdown("""
     .stTabs [data-baseweb="tab-list"] { gap: 8px; }
     .stTabs [data-baseweb="tab"] { padding: 10px 18px; border-radius: 6px; background-color: #f1f5f9; font-weight: 600; }
     .stTabs [aria-selected="true"] { background-color: #0284c7 !important; color: white !important; }
+    
+    /* Configuración para que el texto de las descripciones largas haga Wrap automáticamente en la tabla */
+    [data-testid="stDataFrame"] div[data-testid="StyledFullScreenButton"] { display: none; }
     </style>
 """, unsafe_allow_html=True)
 
@@ -191,12 +194,13 @@ st.title("🏢 MONSTRUO DE CONTROL TOTAL: Compras, Importaciones & Proyectos")
 st.caption("Consola unificada con sincronización automática de Odoo API, Philips, CARGO y Google Sheets.")
 
 if not df_po_filtered.empty and 'Referencia de la orden' in df_po_filtered.columns:
-    monto_total = df_po_filtered['Total_MXN'].sum() if 'Total_MXN' in df_po_filtered.columns else 0
-    vencidas_cnt = len(df_po_filtered[df_po_filtered['Semaforo'] == '🔴 Vencido']) if 'Semaforo' in df_po_filtered.columns else 0
+    df_po_grp = df_po_filtered.groupby('Referencia de la orden').first().reset_index()
+    monto_total = df_po_grp['Total_MXN'].sum() if 'Total_MXN' in df_po_grp.columns else 0
+    vencidas_cnt = len(df_po_grp[df_po_grp['Semaforo'].str.contains('Vencido', na=False)]) if 'Semaforo' in df_po_grp.columns else 0
     
-    imp_unicas = df_po_filtered[df_po_filtered['Tipo_Proveedor'].str.contains("Importación", na=False)]
-    imp_cnt = imp_unicas['Referencia de la orden'].nunique()
-    imp_criticas = imp_unicas[imp_unicas['Semaforo_Importacion'].str.contains("CRÍTICO", na=False)]['Referencia de la orden'].nunique()
+    imp_unicas = df_po_grp[df_po_grp['Tipo_Proveedor'].str.contains("Importación", na=False)]
+    imp_cnt = len(imp_unicas)
+    imp_criticas = len(imp_unicas[imp_unicas['Semaforo_Importacion'].str.contains("CRÍTICO", na=False)]) if 'Semaforo_Importacion' in imp_unicas.columns else 0
 else:
     imp_unicas = pd.DataFrame()
     monto_total = 0
@@ -206,16 +210,16 @@ else:
 
 k1, k2, k3, k4, k5 = st.columns(5)
 k1.markdown(f'<div class="kpi-card"><div class="kpi-title">Gasto Total Compras</div><div class="kpi-value">${monto_total:,.0f} <span style="font-size:0.75rem;">MXN</span></div></div>', unsafe_allow_html=True)
-k2.markdown(f'<div class="kpi-card"><div class="kpi-title">🔴 Partidas Vencidas</div><div class="kpi-value" style="color:#dc2626;">{vencidas_cnt:,}</div></div>', unsafe_allow_html=True)
+k2.markdown(f'<div class="kpi-card"><div class="kpi-title">🔴 OCs Vencidas o Atrasadas</div><div class="kpi-value" style="color:#dc2626;">{vencidas_cnt:,}</div></div>', unsafe_allow_html=True)
 k3.markdown(f'<div class="kpi-card"><div class="kpi-title">🚢 OCs Importación</div><div class="kpi-value" style="color:#0284c7;">{imp_cnt:,}</div></div>', unsafe_allow_html=True)
 k4.markdown(f'<div class="kpi-card"><div class="kpi-title">📦 Embarques CARGO</div><div class="kpi-value" style="color:#d97706;">{get_safe_len(df_cargo):,}</div></div>', unsafe_allow_html=True)
 k5.markdown(f'<div class="kpi-card"><div class="kpi-title">Proyectos Activos</div><div class="kpi-value">{get_safe_nunique(df_config, "Proyecto_Nombre")}</div></div>', unsafe_allow_html=True)
 
 st.markdown("<br>", unsafe_allow_html=True)
 
-COLS_PO_SHOW = ['Referencia de la orden', 'Empresa', 'Estado', 'Semaforo', 'Tipo_Proveedor', 'Proveedor', 'Producto', 'Cantidad', 'Precio Unitario', 'Moneda', 'Total', 'Total_MXN', 'Comprador', 'Fecha_Limite']
-
-# FUNCIÓN MEJORADA: VISUALIZACIÓN INTERACTIVA TIPO ODOO
+# ---------------------------------------------------------
+# FUNCION VISTA EXPEDIENTE ODOO DESPLEGABLE
+# ---------------------------------------------------------
 def render_detalle_por_empresa(df_base, prefix_key="gen"):
     if df_base.empty:
         st.info("Sin registros disponibles.")
@@ -223,27 +227,18 @@ def render_detalle_por_empresa(df_base, prefix_key="gen"):
 
     empresas_list = list(df_base['Empresa'].unique()) if 'Empresa' in df_base.columns else []
     
-    st.markdown("### 🏢 Selecciona una Empresa para ver el Detalle de sus Órdenes de Compra:")
+    st.markdown("### 🏢 Selecciona una Empresa para ver sus Órdenes de Compra:")
     
     tab_titles = ["🏢 TODAS LAS EMPRESAS (" + str(df_base['Referencia de la orden'].nunique()) + " OCs)"] + [f"🏢 {emp} ({df_base[df_base['Empresa']==emp]['Referencia de la orden'].nunique()} OCs)" for emp in empresas_list]
     tabs = st.tabs(tab_titles)
 
-    # 1. TAB TODAS LAS EMPRESAS
+    # VISTA: TODAS LAS EMPRESAS
     with tabs[0]:
-        st.markdown("#### 📋 Detalle de Órdenes de Compra")
-        
-        modo_vista = st.radio(
-            "📐 Modo de Visualización del Reporte:",
-            ["📋 Partidas Individuales (Estilo Odoo - Renglón por Código)", "📁 Expediente Desplegable por OC (Ver Tarjetas Odoo)"],
-            horizontal=True,
-            key=f"{prefix_key}_modo_all"
-        )
-
         c_f1, c_f2 = st.columns([2, 1])
         with c_f1:
-            q_search = st.text_input("🔍 Buscar por Folio de OC, Proveedor, Código o Producto:", "", key=f"{prefix_key}_search_all")
+            q_search = st.text_input("🔍 Buscar por Folio OC, Proveedor o Producto:", "", key=f"{prefix_key}_search_all")
         with c_f2:
-            sem_filter = st.selectbox("Filtrar por Semáforo:", ["TODOS"] + list(df_base['Semaforo'].unique()), key=f"{prefix_key}_sem_all")
+            sem_filter = st.selectbox("Filtrar por Estatus de Recepción:", ["TODOS"] + list(df_base['Semaforo'].unique()), key=f"{prefix_key}_sem_all")
 
         df_view = df_base.copy()
         if q_search:
@@ -254,56 +249,46 @@ def render_detalle_por_empresa(df_base, prefix_key="gen"):
         if sem_filter != "TODOS":
             df_view = df_view[df_view['Semaforo'] == sem_filter]
 
-        if modo_vista.startswith("📋 Partidas Individuales"):
-            cols_curr = [c for c in COLS_PO_SHOW if c in df_view.columns]
-            st.dataframe(df_view[cols_curr], use_container_width=True)
-        else:
-            # Vista Expediente Desplegable
-            oc_unicas = df_view['Referencia de la orden'].unique()
-            st.caption(f"Mostrando {len(oc_unicas)} Órdenes de Compra:")
-            for oc_ref in oc_unicas[:100]: # Límite de 100 por rendimiento
-                df_oc = df_view[df_view['Referencia de la orden'] == oc_ref]
-                first_row = df_oc.iloc[0]
-                total_oc = df_oc['Total_MXN'].sum()
-                items_cnt = len(df_oc)
+        oc_unicas = df_view['Referencia de la orden'].unique()
+        st.caption(f"Mostrando {len(oc_unicas)} Órdenes de Compra (Despliega la pestaña para ver la tabla de detalles tipo Odoo)")
+        
+        for oc_ref in oc_unicas[:50]: # Muestra los primeros 50 para evitar sobrecarga del navegador
+            df_oc = df_view[df_view['Referencia de la orden'] == oc_ref]
+            first_row = df_oc.iloc[0]
+            total_oc_mxn = df_oc['Total_MXN'].sum()
+            items_cnt = len(df_oc)
+            
+            with st.expander(f"📄 **{oc_ref}** | {first_row['Proveedor']} | **${total_oc_mxn:,.2f} MXN** | {first_row['Semaforo']} ({items_cnt} Partidas)"):
+                c1, c2, c3 = st.columns(3)
+                c1.write(f"**Empresa:** {first_row['Empresa']}")
+                c1.write(f"**Comprador:** {first_row['Comprador']}")
+                c2.write(f"**Estado Original:** {first_row['Estado']}")
+                c2.write(f"**Tipo Proveedor:** {first_row['Tipo_Proveedor']}")
+                c3.write(f"**Fecha Límite Odoo:** {first_row['Fecha_Limite']}")
                 
-                with st.expander(f"📄 **{oc_ref}** | {first_row['Proveedor']} | **${total_oc:,.2f} MXN** | {first_row['Semaforo']} ({items_cnt} Partidas)"):
-                    c1, c2, c3 = st.columns(3)
-                    c1.write(f"**Empresa:** {first_row['Empresa']}")
-                    c1.write(f"**Comprador:** {first_row['Comprador']}")
-                    c2.write(f"**Estado:** {first_row['Estado']}")
-                    c2.write(f"**Tipo Proveedor:** {first_row['Tipo_Proveedor']}")
-                    c3.write(f"**Fecha Límite:** {first_row['Fecha_Limite']}")
-                    
-                    st.markdown("##### 📦 Líneas de la Orden (Partidas de Odoo):")
-                    cols_partidas = [c for c in ['Producto', 'Cantidad', 'Precio Unitario', 'Moneda', 'Total', 'Total_MXN'] if c in df_oc.columns]
-                    st.dataframe(df_oc[cols_partidas], use_container_width=True)
+                st.markdown("##### 📦 Líneas de la Orden (Partidas de Odoo):")
+                # Se configuran las columnas mostrando Producto completo usando st.dataframe 
+                cols_partidas = ['Producto', 'Cantidad', 'Recibido', 'Precio_Unitario', 'Moneda', 'Total', 'Semaforo']
+                st.dataframe(df_oc[cols_partidas], use_container_width=True, hide_index=True)
 
-    # 2. TABS POR EMPRESA INDIVIDUAL
+    # VISTA: POR EMPRESA
     for idx, emp_name in enumerate(empresas_list):
         with tabs[idx + 1]:
-            st.markdown(f"#### 📋 Detalle de Órdenes de Compra de: **{emp_name}**")
             df_emp = df_base[df_base['Empresa'] == emp_name].copy()
+            df_emp_grp = df_emp.groupby('Referencia de la orden').first().reset_index()
 
-            m_emp = df_emp['Total_MXN'].sum()
-            cnt_emp = df_emp['Referencia de la orden'].nunique()
-            venc_emp = len(df_emp[df_emp['Semaforo'] == '🔴 Vencido'])
-            imp_emp = df_emp[df_emp['Tipo_Proveedor'].str.contains('Importación', na=False)]['Referencia de la orden'].nunique()
+            m_emp = df_emp_grp['Total_MXN'].sum()
+            cnt_emp = len(df_emp_grp)
+            venc_emp = len(df_emp_grp[df_emp_grp['Semaforo'].str.contains('Vencido|Atraso', na=False)])
+            imp_emp = len(df_emp_grp[df_emp_grp['Tipo_Proveedor'].str.contains('Importación', na=False)])
 
             e1, e2, e3, e4 = st.columns(4)
             e1.markdown(f'<div class="kpi-card"><div class="kpi-title">Monto Total ({emp_name})</div><div class="kpi-value">${m_emp:,.0f} MXN</div></div>', unsafe_allow_html=True)
             e2.markdown(f'<div class="kpi-card"><div class="kpi-title">Órdenes Únicas</div><div class="kpi-value">{cnt_emp:,}</div></div>', unsafe_allow_html=True)
-            e3.markdown(f'<div class="kpi-card"><div class="kpi-title">🔴 Partidas Vencidas</div><div class="kpi-value" style="color:#dc2626;">{venc_emp:,}</div></div>', unsafe_allow_html=True)
-            e4.markdown(f'<div class="kpi-card"><div class="kpi-title">🚢 OCs Importación</div><div class="kpi-value" style="color:#0284c7;">{imp_emp:,}</div></div>', unsafe_allow_html=True)
+            e3.markdown(f'<div class="kpi-card"><div class="kpi-title">🔴 OCs Vencidas/Atraso</div><div class="kpi-value" style="color:#dc2626;">{venc_emp:,}</div></div>', unsafe_allow_html=True)
+            e4.markdown(f'<div class="kpi-card"><div class="kpi-title">🚢 Importación</div><div class="kpi-value" style="color:#0284c7;">{imp_emp:,}</div></div>', unsafe_allow_html=True)
 
             st.markdown("<br>", unsafe_allow_html=True)
-
-            modo_vista_emp = st.radio(
-                f"📐 Modo de Visualización en {emp_name}:",
-                ["📋 Partidas Individuales (Estilo Odoo)", "📁 Expediente Desplegable por OC"],
-                horizontal=True,
-                key=f"{prefix_key}_modo_{idx}"
-            )
 
             cf1, cf2 = st.columns([2, 1])
             with cf1:
@@ -319,27 +304,23 @@ def render_detalle_por_empresa(df_base, prefix_key="gen"):
             if s_emp != "TODOS":
                 df_emp = df_emp[df_emp['Semaforo'] == s_emp]
 
-            if modo_vista_emp.startswith("📋 Partidas Individuales"):
-                cols_curr = [c for c in COLS_PO_SHOW if c in df_emp.columns]
-                st.dataframe(df_emp[cols_curr], use_container_width=True)
-            else:
-                oc_unicas_e = df_emp['Referencia de la orden'].unique()
-                for oc_ref in oc_unicas_e[:100]:
-                    df_oc_e = df_emp[df_emp['Referencia de la orden'] == oc_ref]
-                    first_row_e = df_oc_e.iloc[0]
-                    total_oc_e = df_oc_e['Total_MXN'].sum()
-                    items_cnt_e = len(df_oc_e)
+            oc_unicas_e = df_emp['Referencia de la orden'].unique()
+            for oc_ref in oc_unicas_e[:50]:
+                df_oc_e = df_emp[df_emp['Referencia de la orden'] == oc_ref]
+                first_row_e = df_oc_e.iloc[0]
+                total_oc_e = df_oc_e['Total_MXN'].sum()
+                items_cnt_e = len(df_oc_e)
+                
+                with st.expander(f"📄 **{oc_ref}** | {first_row_e['Proveedor']} | **${total_oc_e:,.2f} MXN** | {first_row_e['Semaforo']} ({items_cnt_e} Partidas)"):
+                    c1, c2, c3 = st.columns(3)
+                    c1.write(f"**Empresa:** {first_row_e['Empresa']}")
+                    c1.write(f"**Comprador:** {first_row_e['Comprador']}")
+                    c2.write(f"**Estado Original:** {first_row_e['Estado']}")
+                    c2.write(f"**Tipo Proveedor:** {first_row_e['Tipo_Proveedor']}")
+                    c3.write(f"**Fecha Límite Odoo:** {first_row_e['Fecha_Limite']}")
                     
-                    with st.expander(f"📄 **{oc_ref}** | {first_row_e['Proveedor']} | **${total_oc_e:,.2f} MXN** | {first_row_e['Semaforo']} ({items_cnt_e} Partidas)"):
-                        c1, c2, c3 = st.columns(3)
-                        c1.write(f"**Empresa:** {first_row_e['Empresa']}")
-                        c1.write(f"**Comprador:** {first_row_e['Comprador']}")
-                        c2.write(f"**Estado:** {first_row_e['Estado']}")
-                        c2.write(f"**Tipo Proveedor:** {first_row_e['Tipo_Proveedor']}")
-                        c3.write(f"**Fecha Límite:** {first_row_e['Fecha_Limite']}")
-                        
-                        cols_partidas = [c for c in ['Producto', 'Cantidad', 'Precio Unitario', 'Moneda', 'Total', 'Total_MXN'] if c in df_oc_e.columns]
-                        st.dataframe(df_oc_e[cols_partidas], use_container_width=True)
+                    cols_partidas = ['Producto', 'Cantidad', 'Recibido', 'Precio_Unitario', 'Moneda', 'Total', 'Semaforo']
+                    st.dataframe(df_oc_e[cols_partidas], use_container_width=True, hide_index=True)
 
 # ---------------------------------------------------------
 # PESTAÑAS PÚBLICAS DEL DASHBOARD
@@ -357,14 +338,25 @@ with t1:
     if df_po_filtered.empty:
         st.info("💡 Sin datos de Compras. Presiona 'Sincronizar Todo en Vivo' en el menú lateral.")
     else:
+        df_po_grp_graph = df_po_filtered.groupby('Referencia de la orden').first().reset_index()
         c1, c2 = st.columns(2)
         with c1:
             st.subheader("Semáforo General de Entregas")
-            if not df_po_filtered.empty and 'Semaforo' in df_po_filtered.columns:
-                df_sem = df_po_filtered['Semaforo'].value_counts().reset_index()
+            if not df_po_grp_graph.empty and 'Semaforo' in df_po_grp_graph.columns:
+                df_sem = df_po_grp_graph['Semaforo'].value_counts().reset_index()
                 df_sem.columns = ['Semaforo', 'Cantidad']
                 fig_sem = px.pie(df_sem, names='Semaforo', values='Cantidad', hole=0.45, color='Semaforo',
-                                 color_discrete_map={"🔴 Vencido": "#ef4444", "🟡 Próximo a Vencer (<=7 días)": "#f59e0b", "🟢 A Tiempo": "#10b981", "⚪ Sin Fecha": "#94a3b8", "⚪ Inactivo / Creado": "#cbd5e1"})
+                                 color_discrete_map={
+                                     "🔴 Vencido (No Recibido)": "#dc2626", 
+                                     "🔴 Atraso en Saldo Pendiente": "#b91c1c",
+                                     "🟡 Próximo a Vencer (<=7 días)": "#f59e0b", 
+                                     "🟢 A Tiempo (En tránsito)": "#10b981", 
+                                     "🔵 Recibido Parcial (En tiempo)": "#3b82f6",
+                                     "🔵 Recibido Parcial (Sin Fecha)": "#60a5fa",
+                                     "🟢 Recibido Totalmente": "#166534",
+                                     "⚫ Cancelado": "#1f2937",
+                                     "⚪ Sin Fecha": "#94a3b8"
+                                 })
                 st.plotly_chart(fig_sem, use_container_width=True)
         with c2:
             st.subheader("Top 10 Proveedores por Monto de Compra")
@@ -443,11 +435,13 @@ with t2:
                     "⚠️ URGENTE: Vence ≤7 días (Solicitar Pedimento)": "#f59e0b",
                     "🟡 PRECAUCIÓN: Próximo 8-15 días (Validar Doc)": "#eab308",
                     "🟢 EN TIEMPO (>15 días)": "#16a34a",
+                    "🟢 RECIBIDO TOTALMENTE EN ADUANA/ALMACEN": "#166534",
+                    "⚫ Cancelado": "#1f2937",
                     "⚪ Inactivo / Creado": "#cbd5e1"
                 }
                 fig_imp_sem = px.bar(df_imp_sem, x='Estatus_Import', y='Cantidad', color='Estatus_Import',
                                      color_discrete_map=map_colors_imp, text_auto=True)
-                fig_imp_sem.update_layout(showlegend=False, xaxis_title="", yaxis_title="Partidas")
+                fig_imp_sem.update_layout(showlegend=False, xaxis_title="", yaxis_title="Órdenes de Compra")
                 st.plotly_chart(fig_imp_sem, use_container_width=True)
 
             with ci2:
@@ -522,7 +516,8 @@ with t5:
         st.markdown("### 1. Coincidencias en Órdenes de Compra (Odoo):")
         if not df_po.empty and 'Referencia de la orden' in df_po.columns:
             m_po = df_po[df_po['Referencia de la orden'].astype(str).str.contains(query, case=False, na=False)]
-            cols_show = [c for c in COLS_PO_SHOW if c in m_po.columns]
+            cols_show = ['Referencia de la orden', 'Proveedor', 'Producto', 'Cantidad', 'Recibido', 'Precio_Unitario', 'Total_MXN', 'Semaforo']
+            cols_show = [c for c in cols_show if c in m_po.columns]
             st.dataframe(m_po[cols_show], use_container_width=True)
             
         st.markdown("### 2. Coincidencias en Tracking Agente Aduanal (CARGO):")
