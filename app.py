@@ -1,446 +1,513 @@
 import os
-import io
-import requests
-import xmlrpc.client
 import pandas as pd
-from datetime import date
-
-DATA_DIR = "data"
-os.makedirs(DATA_DIR, exist_ok=True)
-
-# ---------------------------------------------------------
-# CREDENCIALES OFICIALES Y CONFIGURACIÓN DE ODOO Y SHEETS
-# ---------------------------------------------------------
-ODOO_URL = "https://dispositivosmedicos2024.odoo.com"
-DEFAULT_ODOO_DB = "dispositivosmedicos2024"
-DEFAULT_ODOO_USER = "mnf@manprec.com"
-DEFAULT_ODOO_PASS = "Manprec2025%"
-
-# NUEVO ENLACE ACTUALIZADO PARA PHILIPS (Mismo libro de configuraciones)
-GOOGLE_SHEET_PHILIPS_ID = "1ZhgCW_hCA8dvj2UENKdBupQ9TaK9MWbOFQc6gojALVI"
-GOOGLE_SHEET_CONFIG_ID = "1ZhgCW_hCA8dvj2UENKdBupQ9TaK9MWbOFQc6gojALVI"
-GOOGLE_SHEET_CARGO_ID = "1xYJ2Rr6PCCGBh78RZHqAWGoHmWgfLxIIIT0KRsq1r8U"
-
-# LISTA EXPLICITA DE PROVEEDORES DE IMPORTACIÓN DEFINIDOS POR EL USUARIO
-IMPORT_KEYWORDS = [
-    'at-os', 'merivaara', 'respironics', 'rimsa', 'givas', 'vassilli', 'cmr',
-    'heartstream netherlands', 'healing resources', 'dell marketing',
-    'simad', 'italray', 'opt surgisystems', 'schiller americas inc'
-]
-
-def clasificar_proveedor(nombre_proveedor):
-    if pd.isna(nombre_proveedor):
-        return "🇲🇽 Nacional"
-    nombre_clean = str(nombre_proveedor).lower().strip()
-    
-    if "schiller americas-mexico" in nombre_clean or "schiller americas mexico" in nombre_clean:
-        return "🇲🇽 Nacional"
-        
-    for kw in IMPORT_KEYWORDS:
-        if kw in nombre_clean:
-            return "🚢 Importación (Requiere Doc)"
-    return "🇲🇽 Nacional"
-
-def calcular_semaforo_recepcion(estado_general, qty_ord, qty_rec, fecha_limite, fecha_referencia):
-    if str(estado_general) in ['Cancelado', 'cancel']:
-        return "⚫ Cancelado"
-    
-    q_ord = pd.to_numeric(qty_ord, errors='coerce')
-    q_rec = pd.to_numeric(qty_rec, errors='coerce')
-    q_ord = 0 if pd.isna(q_ord) else q_ord
-    q_rec = 0 if pd.isna(q_rec) else q_rec
-
-    if q_ord > 0 and q_rec >= q_ord:
-        return "🟢 Recibido Totalmente"
-        
-    if q_rec > 0 and q_rec < q_ord:
-        if pd.isna(fecha_limite):
-            return "🔵 Recibido Parcial (Sin Fecha)"
-        dias = (fecha_limite.date() - fecha_referencia).days
-        if dias < 0:
-            return "🔴 Atraso en Saldo Pendiente"
-        return "🔵 Recibido Parcial (En tiempo)"
-
-    if pd.isna(fecha_limite):
-        return "⚪ Sin Fecha"
-        
-    dias_diferencia = (fecha_limite.date() - fecha_referencia).days
-    if dias_diferencia < 0:
-        return "🔴 Vencido (No Recibido)"
-    elif 0 <= dias_diferencia <= 7:
-        return "🟡 Próximo a Vencer (<=7 días)"
-    else:
-        return "🟢 A Tiempo (En tránsito)"
-
-def calcular_semaforo_importacion(row, fecha_referencia):
-    if str(row.get('Tipo_Proveedor')) == "🇲🇽 Nacional":
-        return "🇲🇽 Nacional"
-        
-    sem_gral = str(row.get('Semaforo', ''))
-    if "Recibido Totalmente" in sem_gral:
-        return "🟢 RECIBIDO TOTALMENTE EN ADUANA/ALMACEN"
-    if "Cancelado" in sem_gral:
-        return "⚫ Cancelado"
-        
-    if pd.isna(row.get('Fecha_Limite')):
-        return "⚪ Sin Fecha Límite"
-        
-    dias = (row['Fecha_Limite'].date() - fecha_referencia).days
-    if dias < 0:
-        return "🚨 CRÍTICO: Vencido (Atraso Aduana/Doc)"
-    elif 0 <= dias <= 7:
-        return "⚠️ URGENTE: Vence ≤7 días (Solicitar Pedimento)"
-    elif 8 <= dias <= 15:
-        return "🟡 PRECAUCIÓN: Próximo 8-15 días (Validar Doc)"
-    else:
-        return "🟢 EN TIEMPO (>15 días)"
-
-def buscar_archivo_local(nombres_posibles):
-    for nombre in nombres_posibles:
-        ruta_data = os.path.join(DATA_DIR, nombre)
-        if os.path.exists(ruta_data):
-            return ruta_data
-        if os.path.exists(nombre):
-            return nombre
-    return None
+import streamlit as st
+import plotly.express as px
+from datetime import datetime
+from data_loader import load_po_data, load_philips_data, load_config_data, load_cargo_data, DATA_DIR, DEFAULT_ODOO_DB, DEFAULT_ODOO_USER, DEFAULT_ODOO_PASS
 
 # ---------------------------------------------------------
-# 1. CARGA EXCLUSIVA DEL MÓDULO DE COMPRAS ODOO (API / EXCEL)
+# CONFIGURACIÓN DE PÁGINA Y ESTILOS
 # ---------------------------------------------------------
-def load_po_data(odoo_db=None, odoo_user=None, odoo_password=None):
-    db = odoo_db if odoo_db else DEFAULT_ODOO_DB
-    user = odoo_user if odoo_user else DEFAULT_ODOO_USER
-    password = odoo_password if odoo_password else DEFAULT_ODOO_PASS
+st.set_page_config(
+    page_title="MONSTRUO MÁSTER: Control Total de Compras & Proyectos",
+    page_icon="🏢",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
 
-    df_live = fetch_odoo_live(db, user, password)
-    if df_live is not None and not df_live.empty:
-        return df_live
-
-    ruta = buscar_archivo_local([
-        "Orden de compra (purchase.order).xlsx",
-        "Orden de compra (purchase.order)_2.xlsx",
-        "purchase.order.xlsx"
-    ])
-    if not ruta or not os.path.exists(ruta):
-        return pd.DataFrame()
-
-    try:
-        df = pd.read_excel(ruta)
-        return procesar_df_po(df)
-    except Exception:
-        return pd.DataFrame()
-
-def fetch_odoo_live(db, user, password):
-    try:
-        common = xmlrpc.client.ServerProxy(f'{ODOO_URL}/xmlrpc/2/common')
-        uid = None
-        for db_option in [db, "dispositivosmedicos2024", "dispositivosmedicos2024.odoo.com"]:
-            try:
-                auth_uid = common.authenticate(db_option, user, password, {})
-                if auth_uid:
-                    uid = auth_uid
-                    db = db_option
-                    break
-            except Exception:
-                continue
-
-        if not uid:
-            return None
-
-        models = xmlrpc.client.ServerProxy(f'{ODOO_URL}/xmlrpc/2/object')
-        
-        po_domain = [('state', '!=', 'cancel')]
-        po_ids = models.execute_kw(db, uid, password, 'purchase.order', 'search', [po_domain])
-        
-        if not po_ids:
-            return None
-
-        po_fields = ['id', 'name', 'partner_id', 'user_id', 'company_id', 'state', 'date_planned', 'amount_total', 'currency_id']
-        orders = models.execute_kw(db, uid, password, 'purchase.order', 'read', [po_ids], {'fields': po_fields})
-        
-        if not orders:
-            return None
-
-        po_dict = {}
-        for po in orders:
-            po_dict[po['id']] = {
-                'po_name': str(po.get('name', 'Sin Ref')).strip(),
-                'vendor': po['partner_id'][1] if isinstance(po.get('partner_id'), (list, tuple)) else 'Sin Proveedor',
-                'buyer': po['user_id'][1] if isinstance(po.get('user_id'), (list, tuple)) else 'Sin Asignar',
-                'company': po['company_id'][1] if isinstance(po.get('company_id'), (list, tuple)) else 'Sin Empresa',
-                'state': po.get('state', 'draft'),
-                'date_planned': po.get('date_planned'),
-                'amount_total': po.get('amount_total', 0.0),
-                'currency': po['currency_id'][1] if isinstance(po.get('currency_id'), (list, tuple)) else 'MXN'
-            }
-
-        line_ids = models.execute_kw(db, uid, password, 'purchase.order.line', 'search', [[('order_id', 'in', po_ids)]])
-        if line_ids:
-            line_fields = ['order_id', 'product_id', 'name', 'product_qty', 'qty_received', 'price_unit', 'price_subtotal', 'date_planned']
-            lines = models.execute_kw(db, uid, password, 'purchase.order.line', 'read', [line_ids], {'fields': line_fields})
-            
-            rows = []
-            for line in lines:
-                order_tuple = line.get('order_id')
-                if not order_tuple or not isinstance(order_tuple, (list, tuple)):
-                    continue
-                p_id = order_tuple[0]
-                po_info = po_dict.get(p_id)
-                if not po_info:
-                    continue
-
-                prod_desc_full = str(line.get('name', 'Sin Especificar'))
-
-                rows.append({
-                    'Referencia de la orden': po_info['po_name'],
-                    'Proveedor': po_info['vendor'],
-                    'Comprador': po_info['buyer'],
-                    'Empresa': po_info['company'],
-                    'Estado_Odoo': po_info['state'],
-                    'Fecha límite de la orden': line.get('date_planned') or po_info['date_planned'],
-                    'Producto': prod_desc_full,
-                    'Cantidad': line.get('product_qty', 1),
-                    'Recibido': line.get('qty_received', 0),
-                    'Precio_Unitario': line.get('price_unit', 0),
-                    'Total': line.get('price_subtotal', 0),
-                    'Moneda': po_info['currency']
-                })
-            
-            if rows:
-                return procesar_df_po(pd.DataFrame(rows))
-
-        rows = []
-        for p_id, po_info in po_dict.items():
-            rows.append({
-                'Referencia de la orden': po_info['po_name'],
-                'Proveedor': po_info['vendor'],
-                'Comprador': po_info['buyer'],
-                'Empresa': po_info['company'],
-                'Estado_Odoo': po_info['state'],
-                'Fecha límite de la orden': po_info['date_planned'],
-                'Producto': 'Consolidado Compras',
-                'Cantidad': 1,
-                'Recibido': 0,
-                'Precio_Unitario': po_info['amount_total'],
-                'Total': po_info['amount_total'],
-                'Moneda': po_info['currency']
-            })
-        return procesar_df_po(pd.DataFrame(rows))
-
-    except Exception as e:
-        print(f"Aviso API Odoo: {e}")
-    return None
-
-def procesar_df_po(df_in):
-    if df_in.empty:
-        return pd.DataFrame()
-
-    df = df_in.copy()
-
-    if 'Referencia de la orden' in df.columns and 'Total' in df.columns:
-        df = df.dropna(subset=['Referencia de la orden'], how='all')
-
-    df['Referencia de la orden'] = df['Referencia de la orden'].ffill().fillna('Sin Ref')
-    df['Comprador'] = df['Comprador'].ffill().fillna('Sin Asignar')
-    df['Empresa'] = df['Empresa'].ffill().fillna('Sin Empresa')
-    df['Proveedor'] = df['Proveedor'].ffill().fillna('Sin Proveedor')
-    df['Moneda'] = df['Moneda'].fillna('MXN')
-    df['Producto'] = df['Producto'].fillna('Sin Especificar')
-    
-    if 'Recibido' not in df.columns: df['Recibido'] = 0
-    if 'Precio_Unitario' not in df.columns: df['Precio_Unitario'] = 0
-    if 'Estado_Odoo' not in df.columns and 'Estado' in df.columns: df['Estado_Odoo'] = df['Estado']
-    
-    df['Estado_Odoo'] = df['Estado_Odoo'].fillna('Sin Estado')
-
-    estado_map = {
-        'draft': 'Solicitud de cotización',
-        'sent': 'Cotización enviada',
-        'to approve': 'Por aprobar',
-        'purchase': 'Orden de compra',
-        'done': 'Bloqueado / Hecho',
-        'cancel': 'Cancelado'
+st.markdown("""
+    <style>
+    .main .block-container { padding-top: 1.2rem; max-width: 98% !important; }
+    .kpi-card {
+        background: #ffffff; padding: 14px 18px; border-radius: 8px;
+        border: 1px solid #e2e8f0; box-shadow: 0 2px 4px rgba(0,0,0,0.04);
     }
-    df['Estado'] = df['Estado_Odoo'].replace(estado_map)
-
-    tasas = {'MXN': 1.0, 'USD': 17.50, 'EUR': 19.00, 'GBP': 22.00}
-    df['Total'] = pd.to_numeric(df['Total'] if 'Total' in df.columns else 0, errors='coerce').fillna(0)
-    df['Precio_Unitario'] = pd.to_numeric(df['Precio_Unitario'], errors='coerce').fillna(0)
-    df['Total_MXN'] = df.apply(lambda r: r['Total'] * tasas.get(str(r['Moneda']).upper(), 1.0), axis=1)
+    .kpi-title { font-size: 0.8rem; color: #64748b; font-weight: 600; text-transform: uppercase; }
+    .kpi-value { font-size: 1.45rem; color: #0f172a; font-weight: 700; margin-top: 4px; }
+    .alert-box-red {
+        background-color: #fef2f2; border-left: 5px solid #ef4444;
+        padding: 12px 16px; border-radius: 6px; margin-bottom: 12px; color: #991b1b;
+    }
+    .alert-box-yellow {
+        background-color: #fffbeb; border-left: 5px solid #f59e0b;
+        padding: 12px 16px; border-radius: 6px; margin-bottom: 12px; color: #92400e;
+    }
+    .admin-badge {
+        background-color: #dcfce7; color: #166534; padding: 6px 12px;
+        border-radius: 6px; font-weight: bold; font-size: 0.85rem;
+        display: inline-block; margin-bottom: 10px; text-align: center; width: 100%;
+    }
+    .stTabs [data-baseweb="tab-list"] { gap: 8px; }
+    .stTabs [data-baseweb="tab"] { padding: 10px 18px; border-radius: 6px; background-color: #f1f5f9; font-weight: 600; }
+    .stTabs [aria-selected="true"] { background-color: #0284c7 !important; color: white !important; }
     
-    cant_col = 'Cantidad' if 'Cantidad' in df.columns else ('Producto/Cantidad de material' if 'Producto/Cantidad de material' in df.columns else 'Cantidad')
-    df['Cantidad'] = pd.to_numeric(df[cant_col], errors='coerce').fillna(1)
-    df['Recibido'] = pd.to_numeric(df['Recibido'], errors='coerce').fillna(0)
-    
-    df['Tipo_Proveedor'] = df['Proveedor'].apply(clasificar_proveedor)
-    fecha_col = 'Fecha límite de la orden' if 'Fecha límite de la orden' in df.columns else 'Fecha'
-    df['Fecha_Limite'] = pd.to_datetime(df[fecha_col] if fecha_col in df.columns else None, errors='coerce')
-    
-    fecha_ref = date(2026, 9, 8)
-    
-    df['Semaforo'] = df.apply(lambda r: calcular_semaforo_recepcion(r['Estado_Odoo'], r['Cantidad'], r['Recibido'], r['Fecha_Limite'], fecha_ref), axis=1)
-    df['Semaforo_Importacion'] = df.apply(lambda r: calcular_semaforo_importacion(r, fecha_ref), axis=1)
-
-    return df
+    /* Configuración para que el texto de las descripciones largas haga Wrap automáticamente en la tabla */
+    [data-testid="stDataFrame"] div[data-testid="StyledFullScreenButton"] { display: none; }
+    </style>
+""", unsafe_allow_html=True)
 
 # ---------------------------------------------------------
-# 2. CARGA DE SEGUIMIENTO PHILIPS (AHORA APUNTA A "SEGUIMIENTO OC")
+# CONSTANTES DE ADMINISTRACIÓN Y ARCHIVOS
 # ---------------------------------------------------------
-def load_philips_data():
-    url_online = f"https://docs.google.com/spreadsheets/d/{GOOGLE_SHEET_PHILIPS_ID}/export?format=xlsx"
-    try:
-        response = requests.get(url_online, timeout=10)
-        if response.status_code == 200:
-            xls = pd.ExcelFile(io.BytesIO(response.content))
-            return procesar_excel_philips(xls)
-    except Exception: pass
+ADMIN_USER = "admin"
+ADMIN_PASSWORD = "compras2026*"
+METADATA_FILE = os.path.join(DATA_DIR, "last_update.txt")
 
-    ruta = buscar_archivo_local(["Seguimiento Philips _ MPC - Ordenes de compra.xlsx", "Seguimiento Philips _ MPC - Ordenes de compra_2.xlsx"])
-    if ruta and os.path.exists(ruta):
-        try: return procesar_excel_philips(pd.ExcelFile(ruta))
-        except Exception: pass
-    return pd.DataFrame()
+def get_safe_len(df):
+    return len(df) if df is not None and not df.empty else 0
 
-def procesar_excel_philips(xls):
-    dfs = []
+def get_safe_nunique(df, col):
+    if df is not None and not df.empty and col in df.columns:
+        return df[col].nunique()
+    return 0
+
+def save_uploaded_file(uploaded_file, target_filename):
+    path = os.path.join(DATA_DIR, target_filename)
+    with open(path, "wb") as f:
+        f.write(uploaded_file.getbuffer())
     
-    # 1. Prioridad: Buscar la nueva pestaña "SEGUIMIENTO OC"
-    if 'SEGUIMIENTO OC' in xls.sheet_names:
-        df_s = pd.read_excel(xls, sheet_name='SEGUIMIENTO OC')
+    now_str = datetime.now().strftime("%d/%m/%Y a las %H:%M hrs")
+    with open(METADATA_FILE, "w", encoding="utf-8") as f:
+        f.write(now_str)
         
-        # Búsqueda dinámica de encabezados en caso de que añadan filas de títulos arriba
-        if not any(c in str(df_s.columns).upper() for c in ['ORDEN', 'OC', 'ESTATUS', 'SITUACIÓN', 'PROYECTO', 'DESCRIPCIÓN', 'CANTIDAD', 'EMPRESA']):
-            for h in [1, 2, 3]:
-                try:
-                    df_h = pd.read_excel(xls, sheet_name='SEGUIMIENTO OC', header=h)
-                    if any(c in str(df_h.columns).upper() for c in ['ORDEN', 'OC', 'ESTATUS', 'SITUACIÓN', 'PROYECTO', 'DESCRIPCIÓN', 'CANTIDAD', 'EMPRESA']):
-                        df_s = df_h
-                        break
-                except Exception:
-                    pass
-                    
-        df_s['Origen_Hoja'] = 'SEGUIMIENTO OC'
-        dfs.append(df_s)
-    else:
-        # Fallback de emergencia a la estructura antigua
-        if 'Hoja 1' in xls.sheet_names:
-            df1 = pd.read_excel(xls, sheet_name='Hoja 1', header=2)
-            if not df1.empty and 'Empresa' in df1.iloc[0].values:
-                df1 = pd.read_excel(xls, sheet_name='Hoja 1', header=3)
-            df1['Origen_Hoja'] = 'General Philips'
-            dfs.append(df1)
-        for sheet in xls.sheet_names:
-            if sheet in ['Hoja 10', 'Q1 - 2025', 'Hoja 8', 'Hoja 6']:
-                h = 1 if sheet in ['Q1 - 2025', 'Hoja 6'] else 0
-                df_s = pd.read_excel(xls, sheet_name=sheet, header=h)
-                df_s['Origen_Hoja'] = sheet
-                dfs.append(df_s)
+    st.cache_data.clear()
+
+@st.cache_data(ttl=60)
+def cargar_todo(odoo_db=None, odoo_user=None, odoo_pass=None):
+    return load_po_data(odoo_db, odoo_user, odoo_pass), load_philips_data(), load_config_data(), load_cargo_data()
+
+# ---------------------------------------------------------
+# BARRA LATERAL (CENTRO DE CONTROL)
+# ---------------------------------------------------------
+st.sidebar.title("🎛️ Centro de Control")
+
+if 'odoo_db' not in st.session_state: st.session_state['odoo_db'] = DEFAULT_ODOO_DB
+if 'odoo_user' not in st.session_state: st.session_state['odoo_user'] = DEFAULT_ODOO_USER
+if 'odoo_pass' not in st.session_state: st.session_state['odoo_pass'] = DEFAULT_ODOO_PASS
+
+if st.sidebar.button("🔄 Sincronizar Todo en Vivo desde la Nube", type="primary", use_container_width=True):
+    st.cache_data.clear()
+    now_str = datetime.now().strftime("%d/%m/%Y a las %H:%M hrs")
+    with open(METADATA_FILE, "w", encoding="utf-8") as f:
+        f.write(now_str + " (Sincronizado en Vivo desde Odoo API + Google Sheets)")
+    st.sidebar.success("✅ Nube Sincronizada en Vivo")
+    st.rerun()
+
+st.sidebar.markdown("---")
+
+if 'is_admin' not in st.session_state:
+    st.session_state['is_admin'] = False
+
+if not st.session_state['is_admin']:
+    with st.sidebar.popover("🔐 Acceso Administrador", use_container_width=True):
+        st.subheader("Iniciar Sesión de Admin")
+        user_input = st.text_input("Usuario", key="admin_user_login")
+        pass_input = st.text_input("Contraseña", type="password", key="admin_pass_login")
+        
+        if st.button("Ingresar", type="primary", use_container_width=True):
+            if user_input == ADMIN_USER and pass_input == ADMIN_PASSWORD:
+                st.session_state['is_admin'] = True
+                st.success("Sesión iniciada")
+                st.rerun()
+            else:
+                st.error("Credenciales incorrectas")
+else:
+    st.sidebar.markdown('<div class="admin-badge">🔑 MODALIDAD ADMIN ACTIVA</div>', unsafe_allow_html=True)
+    
+    with st.sidebar.expander("🔌 Conexión API Odoo (Credenciales)", expanded=False):
+        st.caption("Credenciales preconfiguradas:")
+        db_in = st.text_input("Base de Datos", value=st.session_state['odoo_db'])
+        user_in = st.text_input("Usuario / Correo", value=st.session_state['odoo_user'])
+        pass_in = st.text_input("Contraseña / API Key", type="password", value=st.session_state['odoo_pass'])
+        
+        if st.button("Guardar Credenciales", use_container_width=True):
+            st.session_state['odoo_db'] = db_in
+            st.session_state['odoo_user'] = user_in
+            st.session_state['odoo_pass'] = pass_in
+            st.cache_data.clear()
+            st.success("✅ Datos guardados")
+            st.rerun()
+
+    if st.sidebar.button("Salir de Modo Admin", use_container_width=True):
+        st.session_state['is_admin'] = False
+        st.rerun()
+
+st.sidebar.markdown("---")
+
+if os.path.exists(METADATA_FILE):
+    with open(METADATA_FILE, "r", encoding="utf-8") as f:
+        last_update = f.read()
+    st.sidebar.info(f"🕒 **Última Actualización:**\n{last_update}")
+
+# Cargar Datos en Vivo
+df_po, df_philips, df_config, df_cargo = cargar_todo(st.session_state['odoo_db'], st.session_state['odoo_user'], st.session_state['odoo_pass'])
+
+# ---------------------------------------------------------
+# FILTROS DE SEGMENTACIÓN (PÚBLICOS)
+# ---------------------------------------------------------
+st.sidebar.subheader("🔍 Filtros de Segmentación")
+
+if not df_po.empty:
+    tipo_prov_opts = list(df_po['Tipo_Proveedor'].unique()) if 'Tipo_Proveedor' in df_po.columns else []
+    comprador_opts = list(df_po['Comprador'].unique()) if 'Comprador' in df_po.columns else []
+
+    tipo_prov_sel = st.sidebar.multiselect("Origen de Proveedor", options=tipo_prov_opts, default=tipo_prov_opts)
+    comprador_sel = st.sidebar.multiselect("Comprador", options=comprador_opts, default=comprador_opts)
+
+    df_po_filtered = df_po[
+        (df_po['Tipo_Proveedor'].isin(tipo_prov_sel)) &
+        (df_po['Comprador'].isin(comprador_sel))
+    ]
+else:
+    df_po_filtered = df_po
+
+# ---------------------------------------------------------
+# HEADER Y METRICAS CONSOLIDADAS GLOBAL
+# ---------------------------------------------------------
+st.title("🏢 MONSTRUO DE CONTROL TOTAL: Compras, Importaciones & Proyectos")
+st.caption("Consola unificada con sincronización automática de Odoo API, Philips, CARGO y Google Sheets.")
+
+if not df_po_filtered.empty and 'Referencia de la orden' in df_po_filtered.columns:
+    df_po_grp = df_po_filtered.groupby('Referencia de la orden').first().reset_index()
+    monto_total = df_po_grp['Total_MXN'].sum() if 'Total_MXN' in df_po_grp.columns else 0
+    vencidas_cnt = len(df_po_grp[df_po_grp['Semaforo'].str.contains('Vencido', na=False)]) if 'Semaforo' in df_po_grp.columns else 0
+    
+    imp_unicas = df_po_grp[df_po_grp['Tipo_Proveedor'].str.contains("Importación", na=False)]
+    imp_cnt = len(imp_unicas)
+    imp_criticas = len(imp_unicas[imp_unicas['Semaforo_Importacion'].str.contains("CRÍTICO", na=False)]) if 'Semaforo_Importacion' in imp_unicas.columns else 0
+else:
+    imp_unicas = pd.DataFrame()
+    monto_total = 0
+    vencidas_cnt = 0
+    imp_cnt = 0
+    imp_criticas = 0
+
+k1, k2, k3, k4, k5 = st.columns(5)
+k1.markdown(f'<div class="kpi-card"><div class="kpi-title">Gasto Total Compras</div><div class="kpi-value">${monto_total:,.0f} <span style="font-size:0.75rem;">MXN</span></div></div>', unsafe_allow_html=True)
+k2.markdown(f'<div class="kpi-card"><div class="kpi-title">🔴 OCs Vencidas o Atrasadas</div><div class="kpi-value" style="color:#dc2626;">{vencidas_cnt:,}</div></div>', unsafe_allow_html=True)
+k3.markdown(f'<div class="kpi-card"><div class="kpi-title">🚢 OCs Importación</div><div class="kpi-value" style="color:#0284c7;">{imp_cnt:,}</div></div>', unsafe_allow_html=True)
+k4.markdown(f'<div class="kpi-card"><div class="kpi-title">📦 Embarques CARGO</div><div class="kpi-value" style="color:#d97706;">{get_safe_len(df_cargo):,}</div></div>', unsafe_allow_html=True)
+k5.markdown(f'<div class="kpi-card"><div class="kpi-title">Proyectos Activos</div><div class="kpi-value">{get_safe_nunique(df_config, "Proyecto_Nombre")}</div></div>', unsafe_allow_html=True)
+
+st.markdown("<br>", unsafe_allow_html=True)
+
+# ---------------------------------------------------------
+# FUNCION VISTA EXPEDIENTE ODOO DESPLEGABLE
+# ---------------------------------------------------------
+def render_detalle_por_empresa(df_base, prefix_key="gen"):
+    if df_base.empty:
+        st.info("Sin registros disponibles.")
+        return
+
+    empresas_list = list(df_base['Empresa'].unique()) if 'Empresa' in df_base.columns else []
+    
+    st.markdown("### 🏢 Selecciona una Empresa para ver sus Órdenes de Compra:")
+    
+    tab_titles = ["🏢 TODAS LAS EMPRESAS (" + str(df_base['Referencia de la orden'].nunique()) + " OCs)"] + [f"🏢 {emp} ({df_base[df_base['Empresa']==emp]['Referencia de la orden'].nunique()} OCs)" for emp in empresas_list]
+    tabs = st.tabs(tab_titles)
+
+    # VISTA: TODAS LAS EMPRESAS
+    with tabs[0]:
+        c_f1, c_f2 = st.columns([2, 1])
+        with c_f1:
+            q_search = st.text_input("🔍 Buscar por Folio OC, Proveedor o Producto:", "", key=f"{prefix_key}_search_all")
+        with c_f2:
+            sem_filter = st.selectbox("Filtrar por Estatus de Recepción:", ["TODOS"] + list(df_base['Semaforo'].unique()), key=f"{prefix_key}_sem_all")
+
+        df_view = df_base.copy()
+        if q_search:
+            cond = df_view['Referencia de la orden'].astype(str).str.contains(q_search, case=False, na=False) | \
+                   df_view['Proveedor'].astype(str).str.contains(q_search, case=False, na=False) | \
+                   df_view['Producto'].astype(str).str.contains(q_search, case=False, na=False)
+            df_view = df_view[cond]
+        if sem_filter != "TODOS":
+            df_view = df_view[df_view['Semaforo'] == sem_filter]
+
+        oc_unicas = df_view['Referencia de la orden'].unique()
+        st.caption(f"Mostrando {len(oc_unicas)} Órdenes de Compra (Despliega la pestaña para ver la tabla de detalles tipo Odoo)")
+        
+        for oc_ref in oc_unicas[:100]:
+            df_oc = df_view[df_view['Referencia de la orden'] == oc_ref]
+            first_row = df_oc.iloc[0]
+            total_oc_mxn = df_oc['Total_MXN'].sum()
+            items_cnt = len(df_oc)
+            
+            with st.expander(f"📄 **{oc_ref}** | {first_row['Proveedor']} | **${total_oc_mxn:,.2f} MXN** | {first_row['Semaforo']} ({items_cnt} Partidas)"):
+                c1, c2, c3 = st.columns(3)
+                c1.write(f"**Empresa:** {first_row['Empresa']}")
+                c1.write(f"**Comprador:** {first_row['Comprador']}")
+                c2.write(f"**Estado Original:** {first_row['Estado']}")
+                c2.write(f"**Tipo Proveedor:** {first_row['Tipo_Proveedor']}")
+                c3.write(f"**Fecha Límite Odoo:** {first_row['Fecha_Limite']}")
                 
-    df_all = pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
-    if df_all.empty: return pd.DataFrame()
-    
-    new_cols = []
-    for col in df_all.columns:
-        c_str = str(col).strip()
-        if 'Orden' in c_str or 'OC' in c_str: new_cols.append('Orden_Compra')
-        elif 'Estatus' in c_str or 'Situación' in c_str: new_cols.append('Estatus')
-        elif 'Proyecto' in c_str: new_cols.append('Proyecto')
-        elif 'Descripción' in c_str: new_cols.append('Descripcion')
-        elif 'Cantidad' in c_str: new_cols.append('Cantidad')
-        elif 'Empresa' in c_str: new_cols.append('Empresa')
-        else: new_cols.append(col)
+                st.markdown("##### 📦 Líneas de la Orden (Partidas de Odoo):")
+                cols_partidas = ['Producto', 'Cantidad', 'Recibido', 'Precio_Unitario', 'Moneda', 'Total', 'Semaforo']
+                st.dataframe(df_oc[cols_partidas], use_container_width=True, hide_index=True)
 
-    df_all.columns = new_cols
-    df_all = df_all.loc[:, ~df_all.columns.duplicated(keep='first')]
+    # VISTA: POR EMPRESA
+    for idx, emp_name in enumerate(empresas_list):
+        with tabs[idx + 1]:
+            df_emp = df_base[df_base['Empresa'] == emp_name].copy()
+            df_emp_grp = df_emp.groupby('Referencia de la orden').first().reset_index()
 
-    if 'Estatus' not in df_all.columns: df_all['Estatus'] = 'Sin Estatus'
-    else: df_all['Estatus'] = df_all['Estatus'].fillna('Sin Estatus').astype(str)
-    
-    if 'Orden_Compra' not in df_all.columns: df_all['Orden_Compra'] = 'Sin OC'
-    else: df_all['Orden_Compra'] = df_all['Orden_Compra'].fillna('Sin OC').astype(str)
-    
-    if 'Proyecto' not in df_all.columns: df_all['Proyecto'] = 'Sin Proyecto'
-    else: df_all['Proyecto'] = df_all['Proyecto'].fillna('Sin Proyecto').astype(str)
-    
-    return df_all
+            m_emp = df_emp_grp['Total_MXN'].sum()
+            cnt_emp = len(df_emp_grp)
+            venc_emp = len(df_emp_grp[df_emp_grp['Semaforo'].str.contains('Vencido|Atraso', na=False)])
+            imp_emp = len(df_emp_grp[df_emp_grp['Tipo_Proveedor'].str.contains('Importación', na=False)])
+
+            e1, e2, e3, e4 = st.columns(4)
+            e1.markdown(f'<div class="kpi-card"><div class="kpi-title">Monto Total ({emp_name})</div><div class="kpi-value">${m_emp:,.0f} MXN</div></div>', unsafe_allow_html=True)
+            e2.markdown(f'<div class="kpi-card"><div class="kpi-title">Órdenes Únicas</div><div class="kpi-value">{cnt_emp:,}</div></div>', unsafe_allow_html=True)
+            e3.markdown(f'<div class="kpi-card"><div class="kpi-title">🔴 OCs Vencidas/Atraso</div><div class="kpi-value" style="color:#dc2626;">{venc_emp:,}</div></div>', unsafe_allow_html=True)
+            e4.markdown(f'<div class="kpi-card"><div class="kpi-title">🚢 Importación</div><div class="kpi-value" style="color:#0284c7;">{imp_emp:,}</div></div>', unsafe_allow_html=True)
+
+            st.markdown("<br>", unsafe_allow_html=True)
+
+            cf1, cf2 = st.columns([2, 1])
+            with cf1:
+                q_emp = st.text_input(f"🔍 Buscar en {emp_name}:", "", key=f"{prefix_key}_search_{idx}")
+            with cf2:
+                s_emp = st.selectbox(f"Semáforo en {emp_name}:", ["TODOS"] + list(df_emp['Semaforo'].unique()), key=f"{prefix_key}_sem_{idx}")
+
+            if q_emp:
+                cond_e = df_emp['Referencia de la orden'].astype(str).str.contains(q_emp, case=False, na=False) | \
+                         df_emp['Proveedor'].astype(str).str.contains(q_emp, case=False, na=False) | \
+                         df_emp['Producto'].astype(str).str.contains(q_emp, case=False, na=False)
+                df_emp = df_emp[cond_e]
+            if s_emp != "TODOS":
+                df_emp = df_emp[df_emp['Semaforo'] == s_emp]
+
+            oc_unicas_e = df_emp['Referencia de la orden'].unique()
+            for oc_ref in oc_unicas_e[:100]:
+                df_oc_e = df_emp[df_emp['Referencia de la orden'] == oc_ref]
+                first_row_e = df_oc_e.iloc[0]
+                total_oc_e = df_oc_e['Total_MXN'].sum()
+                items_cnt_e = len(df_oc_e)
+                
+                with st.expander(f"📄 **{oc_ref}** | {first_row_e['Proveedor']} | **${total_oc_e:,.2f} MXN** | {first_row_e['Semaforo']} ({items_cnt_e} Partidas)"):
+                    c1, c2, c3 = st.columns(3)
+                    c1.write(f"**Empresa:** {first_row_e['Empresa']}")
+                    c1.write(f"**Comprador:** {first_row_e['Comprador']}")
+                    c2.write(f"**Estado Original:** {first_row_e['Estado']}")
+                    c2.write(f"**Tipo Proveedor:** {first_row_e['Tipo_Proveedor']}")
+                    c3.write(f"**Fecha Límite Odoo:** {first_row_e['Fecha_Limite']}")
+                    
+                    cols_partidas = ['Producto', 'Cantidad', 'Recibido', 'Precio_Unitario', 'Moneda', 'Total', 'Semaforo']
+                    st.dataframe(df_oc_e[cols_partidas], use_container_width=True, hide_index=True)
 
 # ---------------------------------------------------------
-# 3. CARGA DE CONFIGURACIONES 2026
+# PESTAÑAS PÚBLICAS DEL DASHBOARD
 # ---------------------------------------------------------
-def load_config_data():
-    url_online = f"https://docs.google.com/spreadsheets/d/{GOOGLE_SHEET_CONFIG_ID}/export?format=xlsx"
-    try:
-        response = requests.get(url_online, timeout=10)
-        if response.status_code == 200:
-            return procesar_excel_config(pd.ExcelFile(io.BytesIO(response.content)))
-    except Exception: pass
-    ruta = buscar_archivo_local(["PENDIENTES _ CONFIGURACIONES 2026.xlsx", "PENDIENTES _ CONFIGURACIONES 2026_2.xlsx"])
-    if ruta and os.path.exists(ruta):
-        try: return procesar_excel_config(pd.ExcelFile(ruta))
-        except Exception: pass
-    return pd.DataFrame()
+t1, t2, t3, t4, t5 = st.tabs([
+    "📊 1. Control General por Empresas (Odoo POs)",
+    "🚢 2. Control de Importaciones & Agente Aduanal (CARGO)",
+    "💙 3. Tracking Especial Philips",
+    "⚙️ 4. Pendientes & Configuraciones 2026",
+    "🔀 5. Matriz Cruzada & Auditoría Unificada"
+])
 
-def procesar_excel_config(xls):
-    project_dfs = []
-    for sheet_name in xls.sheet_names:
-        if sheet_name in ['DASHBOARD', 'Hoja 30', 'Hoja 31', 'SEGUIMIENTO OC']: continue
-        df_s = pd.read_excel(xls, sheet_name=sheet_name)
-        if df_s.empty: continue
-        header_found = None
-        if 'DESCRIPCIÓN' in df_s.columns or 'PROVEEDOR' in df_s.columns or 'CANTIDAD' in df_s.columns:
-            header_found = 0
+# TAB 1: ODOO POS
+with t1:
+    if df_po_filtered.empty:
+        st.info("💡 Sin datos de Compras. Presiona 'Sincronizar Todo en Vivo' en el menú lateral.")
+    else:
+        df_po_grp_graph = df_po_filtered.groupby('Referencia de la orden').first().reset_index()
+        c1, c2 = st.columns(2)
+        with c1:
+            st.subheader("Semáforo General de Entregas")
+            if not df_po_grp_graph.empty and 'Semaforo' in df_po_grp_graph.columns:
+                df_sem = df_po_grp_graph['Semaforo'].value_counts().reset_index()
+                df_sem.columns = ['Semaforo', 'Cantidad']
+                fig_sem = px.pie(df_sem, names='Semaforo', values='Cantidad', hole=0.45, color='Semaforo',
+                                 color_discrete_map={
+                                     "🔴 Vencido (No Recibido)": "#dc2626", 
+                                     "🔴 Atraso en Saldo Pendiente": "#b91c1c",
+                                     "🟡 Próximo a Vencer (<=7 días)": "#f59e0b", 
+                                     "🟢 A Tiempo (En tránsito)": "#10b981", 
+                                     "🔵 Recibido Parcial (En tiempo)": "#3b82f6",
+                                     "🔵 Recibido Parcial (Sin Fecha)": "#60a5fa",
+                                     "🟢 Recibido Totalmente": "#166534",
+                                     "⚫ Cancelado": "#1f2937",
+                                     "⚪ Sin Fecha": "#94a3b8"
+                                 })
+                st.plotly_chart(fig_sem, use_container_width=True)
+        with c2:
+            st.subheader("Top 10 Proveedores por Monto de Compra")
+            if 'Proveedor' in df_po_filtered.columns and 'Total_MXN' in df_po_filtered.columns:
+                df_prov = df_po_filtered.groupby('Proveedor')['Total_MXN'].sum().reset_index().sort_values('Total_MXN', ascending=False).head(10)
+                fig_prov = px.bar(df_prov, x='Total_MXN', y='Proveedor', orientation='h', text_auto='.2s', color='Total_MXN', color_continuous_scale='Blues')
+                st.plotly_chart(fig_prov, use_container_width=True)
+
+        st.markdown("---")
+        render_detalle_por_empresa(df_po_filtered, prefix_key="tab1")
+
+# TAB 2: IMPORTACIONES & CARGO
+with t2:
+    st.subheader("🚢 Control Unificado de Importaciones, Aduanas & Agente Aduanal CARGO")
+    tab_imp1, tab_imp2 = st.tabs(["📦 Tracking Agente Aduanal (CARGO)", "📋 Control de Órdenes de Importación (Odoo)"])
+
+    with tab_imp1:
+        st.markdown("### 📦 Seguimiento de Operaciones Aduanales y Embarques (Agente CARGO)")
+        if df_cargo.empty:
+            st.info("💡 Cargando o sin datos disponibles en la hoja de seguimiento CARGO.")
         else:
-            for h in [1, 2, 3]:
-                df_s_h = pd.read_excel(xls, sheet_name=sheet_name, header=h)
-                if 'DESCRIPCIÓN' in df_s_h.columns or 'PROVEEDOR' in df_s_h.columns or 'CANTIDAD' in df_s_h.columns:
-                    df_s = df_s_h
-                    header_found = h
-                    break
-        if header_found is not None:
-            df_s['Proyecto_Nombre'] = sheet_name
-            project_dfs.append(df_s)
-    df_all = pd.concat(project_dfs, ignore_index=True) if project_dfs else pd.DataFrame()
-    if df_all.empty: return pd.DataFrame()
-    col_map = {'DESCRIPCIÓN': 'Descripcion', 'CANTIDAD': 'Cantidad', 'PROVEEDOR': 'Proveedor', 'MARCA': 'Marca', 'MODELO': 'Modelo', 'ESTATUS': 'Estatus', 'OC': 'Orden_Compra'}
-    df_all.rename(columns=col_map, inplace=True)
-    df_all = df_all.loc[:, ~df_all.columns.duplicated(keep='first')]
-    if 'Estatus' in df_all.columns: df_all['Estatus'] = df_all['Estatus'].fillna('PENDIENTES / SIN ESTATUS').astype(str)
-    else: df_all['Estatus'] = 'PENDIENTES / SIN ESTATUS'
-    if 'Proyecto_Nombre' not in df_all.columns: df_all['Proyecto_Nombre'] = 'General'
-    return df_all
+            cg1, cg2 = st.columns(2)
+            with cg1:
+                st.metric("Total Embarques Registradas", f"{len(df_cargo):,}")
+            with cg2:
+                hojas_count = df_cargo['Origen_Hoja'].nunique() if 'Origen_Hoja' in df_cargo.columns else 1
+                st.metric("Pestañas en Hoja CARGO", f"{hojas_count}")
 
-# ---------------------------------------------------------
-# 4. CARGA DE SEGUIMIENTO AGENTE ADUANAL (CARGO)
-# ---------------------------------------------------------
-def load_cargo_data():
-    url_online = f"https://docs.google.com/spreadsheets/d/{GOOGLE_SHEET_CARGO_ID}/export?format=xlsx"
-    try:
-        response = requests.get(url_online, timeout=10)
-        if response.status_code == 200:
-            return procesar_excel_cargo(pd.ExcelFile(io.BytesIO(response.content)))
-    except Exception: pass
-    ruta = buscar_archivo_local(["Seguimiento CARGO.xlsx", "CARGO.xlsx"])
-    if ruta and os.path.exists(ruta):
-        try: return procesar_excel_cargo(pd.ExcelFile(ruta))
-        except Exception: pass
-    return pd.DataFrame()
+            st.markdown("---")
+            q_cargo = st.text_input("🔍 Buscar en Tracking CARGO (Pedimento, Contenedor, Referencia, OC, Proveedor):", "", key="search_cargo")
+            df_cargo_view = df_cargo.copy()
+            if q_cargo:
+                cond_c = pd.Series(False, index=df_cargo_view.index)
+                for col in df_cargo_view.columns:
+                    cond_c |= df_cargo_view[col].astype(str).str.contains(q_cargo, case=False, na=False)
+                df_cargo_view = df_cargo_view[cond_c]
+            st.dataframe(df_cargo_view, use_container_width=True)
 
-def procesar_excel_cargo(xls):
-    dfs = []
-    for sheet in xls.sheet_names:
-        try:
-            df_s = pd.read_excel(xls, sheet_name=sheet)
-            if df_s.empty: continue
-            if not any(c in str(df_s.columns).upper() for c in ['PEDIMENTO', 'ADUANA', 'STATUS', 'ESTATUS', 'REFERENCIA', 'PROVEEDOR', 'OC', 'CONTENEDOR']):
-                for h in [1, 2, 3]:
-                    df_h = pd.read_excel(xls, sheet_name=sheet, header=h)
-                    if any(c in str(df_h.columns).upper() for c in ['PEDIMENTO', 'ADUANA', 'STATUS', 'ESTATUS', 'REFERENCIA', 'PROVEEDOR', 'OC', 'CONTENEDOR']):
-                        df_s = df_h
-                        break
-            df_s['Origen_Hoja'] = sheet
-            dfs.append(df_s)
-        except Exception: continue
-    df_all = pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
-    if df_all.empty: return pd.DataFrame()
-    df_all = df_all.dropna(how='all').loc[:, ~df_all.columns.duplicated(keep='first')]
-    return df_all
+    with tab_imp2:
+        if imp_unicas.empty:
+            st.info("No hay órdenes de compra de importación seleccionadas.")
+        else:
+            st.markdown("### 📢 Avisos de Acción Inmediata para Compras Internacionales")
+            criticas_df = imp_unicas[imp_unicas['Semaforo_Importacion'].str.contains("CRÍTICO", na=False)]
+            urgentes_df = imp_unicas[imp_unicas['Semaforo_Importacion'].str.contains("URGENTE", na=False)]
+            
+            if not criticas_df.empty:
+                st.markdown(f"""
+                    <div class="alert-box-red">
+                        <strong>🚨 ALERTA CRÍTICA ({len(criticas_df)} Órdenes Vencidas):</strong><br>
+                        Contactar al agente aduanal CARGO / fabricante, solicitar estatus del despacho y verificar Pedimento / Factura Ciega.
+                    </div>
+                """, unsafe_allow_html=True)
+
+            if not urgentes_df.empty:
+                st.markdown(f"""
+                    <div class="alert-box-yellow">
+                        <strong>⚠️ AVISO URGENTE ({len(urgentes_df)} Órdenes por vencer en ≤7 días):</strong><br>
+                        Exigir al proveedor la Factura Ciega, Confirmación de Embarque y coordinar el ingreso a Almacén.
+                    </div>
+                """, unsafe_allow_html=True)
+
+            ci1, ci2 = st.columns(2)
+            with ci1:
+                st.subheader("Semáforo de Importaciones")
+                df_imp_sem = imp_unicas['Semaforo_Importacion'].value_counts().reset_index()
+                df_imp_sem.columns = ['Estatus_Import', 'Cantidad']
+                map_colors_imp = {
+                    "🚨 CRÍTICO: Vencido (Atraso Aduana/Doc)": "#dc2626",
+                    "⚠️ URGENTE: Vence ≤7 días (Solicitar Pedimento)": "#f59e0b",
+                    "🟡 PRECAUCIÓN: Próximo 8-15 días (Validar Doc)": "#eab308",
+                    "🟢 EN TIEMPO (>15 días)": "#16a34a",
+                    "🟢 RECIBIDO TOTALMENTE EN ADUANA/ALMACEN": "#166534",
+                    "⚫ Cancelado": "#1f2937",
+                    "⚪ Inactivo / Creado": "#cbd5e1"
+                }
+                fig_imp_sem = px.bar(df_imp_sem, x='Estatus_Import', y='Cantidad', color='Estatus_Import',
+                                     color_discrete_map=map_colors_imp, text_auto=True)
+                fig_imp_sem.update_layout(showlegend=False, xaxis_title="", yaxis_title="Órdenes de Compra")
+                st.plotly_chart(fig_imp_sem, use_container_width=True)
+
+            with ci2:
+                st.subheader("Gasto por Proveedor Extranjero")
+                df_prov_imp = imp_unicas.groupby('Proveedor')['Total_MXN'].sum().reset_index().sort_values('Total_MXN', ascending=True)
+                fig_prov_imp = px.bar(df_prov_imp, x='Total_MXN', y='Proveedor', orientation='h', text_auto='.2s', color='Total_MXN', color_continuous_scale='Reds')
+                st.plotly_chart(fig_prov_imp, use_container_width=True)
+
+            st.markdown("---")
+            df_imp_all = df_po_filtered[df_po_filtered['Tipo_Proveedor'].str.contains("Importación", na=False)]
+            render_detalle_por_empresa(df_imp_all, prefix_key="tab2_imp")
+
+# TAB 3: PHILIPS
+with t3:
+    st.subheader("💙 Control y Seguimiento de Órdenes Philips")
+    if df_philips.empty:
+        st.info("💡 Sin datos de Philips.")
+    else:
+        p1, p2 = st.columns(2)
+        with p1:
+            st.subheader("Estatus de Órdenes Philips")
+            df_p_est = df_philips['Estatus'].value_counts().reset_index()
+            df_p_est.columns = ['Estatus', 'Cantidad']
+            fig_p = px.bar(df_p_est, x='Estatus', y='Cantidad', color='Estatus', text_auto=True)
+            st.plotly_chart(fig_p, use_container_width=True)
+        with p2:
+            st.subheader("Registros por Hoja / Sección")
+            df_p_hoja = df_philips['Origen_Hoja'].value_counts().reset_index() if 'Origen_Hoja' in df_philips.columns else pd.DataFrame()
+            if not df_p_hoja.empty:
+                df_p_hoja.columns = ['Hoja', 'Cantidad']
+                fig_p2 = px.pie(df_p_hoja, names='Hoja', values='Cantidad', hole=0.4)
+                st.plotly_chart(fig_p2, use_container_width=True)
+
+        st.subheader("Detalle Completo de Registros Philips")
+        st.dataframe(df_philips, use_container_width=True)
+
+# TAB 4: CONFIGURACIONES
+with t4:
+    st.subheader("⚙️ Pendientes & Configuraciones de Proyectos 2026")
+    if df_config.empty:
+        st.info("💡 Sin datos de Configuraciones.")
+    else:
+        cfg1, cfg2 = st.columns(2)
+        with cfg1:
+            st.subheader("Distribución por Estatus en Almacén / Entrega")
+            if 'Estatus' in df_config.columns:
+                df_c_est = df_config['Estatus'].value_counts().head(10).reset_index()
+                df_c_est.columns = ['Estatus', 'Cantidad']
+                fig_c1 = px.bar(df_c_est, x='Cantidad', y='Estatus', orientation='h', text_auto=True, color='Cantidad', color_continuous_scale='Greens')
+                st.plotly_chart(fig_c1, use_container_width=True)
+        with cfg2:
+            st.subheader("Volumen de Ítems por Proyecto")
+            if 'Proyecto_Nombre' in df_config.columns:
+                df_c_proj = df_config['Proyecto_Nombre'].value_counts().head(10).reset_index()
+                df_c_proj.columns = ['Proyecto', 'Cantidad']
+                fig_c2 = px.bar(df_c_proj, x='Proyecto', y='Cantidad', text_auto=True, color='Cantidad')
+                st.plotly_chart(fig_c2, use_container_width=True)
+
+        st.subheader("Buscador de Equipos por Proyecto")
+        proyectos_lista = ["TODOS"] + list(df_config['Proyecto_Nombre'].unique()) if 'Proyecto_Nombre' in df_config.columns else ["TODOS"]
+        proj_sel = st.selectbox("Seleccionar Proyecto:", proyectos_lista)
+        df_cfg_view = df_config if proj_sel == "TODOS" or 'Proyecto_Nombre' not in df_config.columns else df_config[df_config['Proyecto_Nombre'] == proj_sel]
+        st.dataframe(df_cfg_view, use_container_width=True)
+
+# TAB 5: MATRIZ CRUZADA & AUDITORÍA
+with t5:
+    st.subheader("🔀 Matriz Cruzada & Auditoría Operativa Unificada")
+    st.markdown("Busca cualquier **Orden de Compra**, **Pedimento**, **Proyecto** o **Equipo** para ver su estatus simultáneo:")
+    
+    query = st.text_input("🔍 Ingresa número de OC (ej. MAN01120, MPC05458), Pedimento o Proyecto:", "")
+    if query:
+        st.markdown("### 1. Coincidencias en Órdenes de Compra (Odoo):")
+        if not df_po.empty and 'Referencia de la orden' in df_po.columns:
+            m_po = df_po[df_po['Referencia de la orden'].astype(str).str.contains(query, case=False, na=False)]
+            cols_show = ['Referencia de la orden', 'Proveedor', 'Producto', 'Cantidad', 'Recibido', 'Precio_Unitario', 'Total_MXN', 'Semaforo']
+            cols_show = [c for c in cols_show if c in m_po.columns]
+            st.dataframe(m_po[cols_show], use_container_width=True)
+            
+        st.markdown("### 2. Coincidencias en Tracking Agente Aduanal (CARGO):")
+        if not df_cargo.empty:
+            cond_c = pd.Series(False, index=df_cargo.index)
+            for col in df_cargo.columns:
+                cond_c |= df_cargo[col].astype(str).str.contains(query, case=False, na=False)
+            st.dataframe(df_cargo[cond_c], use_container_width=True)
+
+        st.markdown("### 3. Coincidencias en Tracking Philips:")
+        if not df_philips.empty:
+            cond_phil = pd.Series(False, index=df_philips.index)
+            if 'Orden_Compra' in df_philips.columns:
+                cond_phil |= df_philips['Orden_Compra'].astype(str).str.contains(query, case=False, na=False)
+            if 'Proyecto' in df_philips.columns:
+                cond_phil |= df_philips['Proyecto'].astype(str).str.contains(query, case=False, na=False)
+            st.dataframe(df_philips[cond_phil], use_container_width=True)
+            
+        st.markdown("### 4. Coincidencias en Configuraciones 2026:")
+        if not df_config.empty:
+            cond_cfg = pd.Series(False, index=df_config.index)
+            if 'Orden_Compra' in df_config.columns:
+                cond_cfg |= df_config['Orden_Compra'].astype(str).str.contains(query, case=False, na=False)
+            if 'Proyecto_Nombre' in df_config.columns:
+                cond_cfg |= df_config['Proyecto_Nombre'].astype(str).str.contains(query, case=False, na=False)
+            st.dataframe(df_config[cond_cfg], use_container_width=True)
