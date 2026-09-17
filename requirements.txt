@@ -1,6 +1,5 @@
-streamlit==1.38.0
-pandas<2.2.0
+streamlit
+pandas
 openpyxl
 plotly
 requests
-pyarrow==15.0.2
