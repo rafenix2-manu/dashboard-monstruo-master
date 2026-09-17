@@ -1,5 +1,6 @@
-streamlit
-pandas
+streamlit==1.38.0
+pandas<2.2.0
 openpyxl
 plotly
-jinja2
+requests
+pyarrow==15.0.2
